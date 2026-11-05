@@ -21,3 +21,5 @@ Status labels: NOT_STARTED, IN_PROGRESS, IMPLEMENTED, TESTED, VERIFIED, BLOCKED.
 | Native OS keychain backends and CLI provider commands | NOT_STARTED | `packages/providers/`      | Keychain adapter seam exists; no native backend or CLI package exists yet.                                           |
 | Agent adapters, execution engine, API and clients     | NOT_STARTED | —                          | Deliberately outside this milestone.                                                                                 |
 | Tauri and Docker execution                            | BLOCKED     | —                          | Rust/Cargo and Docker unavailable in inspected environment.                                                          |
+
+Provider implementation commit `96ed19c` passed GitHub Actions run [42045728444](https://github.com/rehanbaqir31-gif/agentos/actions/runs/42045728444), including PostgreSQL 16 migrations/integration tests and all quality steps. Real provider endpoints remain unverified because no live server or API credentials were available.
