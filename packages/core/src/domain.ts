@@ -36,7 +36,7 @@ const jsonValue: z.ZodType<unknown> = z.lazy(() =>
 
 const safeJsonRecord = z.record(z.string(), jsonValue).superRefine((record, context) => {
   const secretKey =
-    /(?:api[_-]?key|password|secret|token|credential|authorization|headers?|environment|^env$)/i;
+    /(?:api[_-]?key|password|secret|token|credential|authorization|environment|^env$)/i;
   const secretValue = /\bBearer\s+[A-Za-z0-9._~+/-]{8,}|\bsk-[A-Za-z0-9_-]{12,}/i;
   const visit = (value: unknown, path: (string | number)[] = []): void => {
     if (Array.isArray(value)) {
@@ -138,7 +138,9 @@ export const providerSchema = z
     baseUrl: providerBaseUrlSchema.nullable(),
     credentialRef: z
       .string()
-      .regex(/^(?:os-credential|keychain|secret-store):[A-Za-z0-9._:/-]+$/)
+      .regex(
+        /^(?:env:[A-Za-z_][A-Za-z0-9_]*|(?:os-credential|keychain|secret-store):[A-Za-z0-9._:/-]+)$/,
+      )
       .nullable(),
     availableModels: z.array(z.string().min(1).max(256)),
     configuration: safeJsonRecord,

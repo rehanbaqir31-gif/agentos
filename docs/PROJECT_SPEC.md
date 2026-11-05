@@ -23,10 +23,14 @@ One documented adapter completes a task in an isolated test repository. The run 
 ## Unresolved decisions
 
 - Select the first adapter after verifying its current documented CLI/API and licensing.
-- Define a PostgreSQL schema/connector and verify it against PostgreSQL before claiming server compatibility.
+- PostgreSQL server support is implemented and verified against PostgreSQL 16 in CI; other server versions remain unverified.
 - Define whether the first local service is embedded in the CLI or runs as a separate API process.
-- Select a secret-storage abstraction and platform-specific backends.
+- A credential reference abstraction exists; select and implement native platform keychain backends.
 - Confirm the exact network and filesystem controls feasible for the first sandbox implementation.
 - Confirm the public project name and repository URL before any public release.
+
+## Provider implementation status
+
+The `@agentos/providers` package currently includes Ollama, configurable OpenAI-compatible chat completions, and official SDK drivers for OpenAI Responses, Anthropic Messages, and Google Gemini. Provider-specific capabilities are intentionally narrower than the vendors' full APIs. Agent execution, tool calling, multimodal inputs, and UI integration remain future work. See [provider integrations](integrations/providers.md).
 
 These choices should be recorded in `docs/DECISIONS/` when resolved.

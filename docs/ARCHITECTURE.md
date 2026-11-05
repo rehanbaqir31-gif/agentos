@@ -12,7 +12,7 @@ clients (web / CLI / desktop) -> versioned API -> application services
                                                                       -> workspace and policy ports
 ```
 
-The workspace foundation now includes `@agentos/core` (Zod domain/event contracts, run lifecycle and common repository contracts) and `@agentos/database` (Drizzle schemas, SQLite and PostgreSQL connectors/migrations, and matching repositories). Runtime packages should be introduced when their contracts and behavior are implemented; do not create empty placeholder integrations.
+The workspace includes `@agentos/core` (Zod domain/event contracts, run lifecycle and common repository contracts), `@agentos/database` (Drizzle schemas and SQLite/PostgreSQL repositories), and `@agentos/providers` (validated provider drivers, normalized requests/responses, credential references and registry). Runtime packages should be introduced when their contracts and behavior are implemented; do not create empty placeholder integrations.
 
 ## Runtime boundaries
 
@@ -21,6 +21,7 @@ The workspace foundation now includes `@agentos/core` (Zod domain/event contract
 - **Database:** migrations, repositories, constraints, and durable event storage.
 - **Runtime:** local worker, workspace lifecycle, policy enforcement, timeouts, cancellation, and recovery.
 - **Adapters/providers:** explicit capability declarations and documented integration contracts.
+- **Provider package:** HTTP transports, endpoint-specific configuration and capability discovery. It does not store API key values in database records or implement agent execution.
 - **Clients:** consume API contracts; no direct host shell or unrestricted filesystem access from UI code.
 
 ## Execution and trust
@@ -37,6 +38,12 @@ Each run receives a unique ID, a dedicated workspace, a versioned manifest witho
 SQLite remains the default local backend at `~/.agentos/agentos.sqlite`; it requires no server. PostgreSQL is an optional server backend selected explicitly through environment configuration. Both implement the asynchronous-compatible `RepositorySet` contracts, while each uses its own Drizzle schema, connection lifecycle, SQL migration runner and dialect-specific statements. The PostgreSQL connector uses a bounded `pg.Pool`, explicit transactions, advisory-lock migration coordination and graceful pool shutdown. SQLite's synchronous repository methods are `Awaitable`, so application code can consistently `await` both backends. No SQLite SQL is assumed to be PostgreSQL-compatible.
 
 PostgreSQL uses UUID, JSONB, TIMESTAMPTZ, native booleans and server constraints; the shared domain uses UUID strings, JSON values and ISO UTC timestamps. PostgreSQL reads normalize timestamps to the same UTC `Z` representation. A cyclic run/manifest composite foreign key is migration-enforced and tested. The PostgreSQL integration suite can run locally on PGlite through the `pg` protocol or against an explicitly supplied PostgreSQL test URL. CI is configured with PostgreSQL 16. Local PGlite is not considered proof of compatibility with a server release; the server job must pass before PostgreSQL is marked verified.
+
+## Provider transport and credentials
+
+`@agentos/providers` defines a shared driver contract and implements Ollama's documented REST API, configurable OpenAI-compatible chat completions, and official OpenAI Responses, Anthropic Messages, and Google Gemini SDK integrations. Drivers validate configuration and untrusted responses with Zod, apply timeouts and cancellation, normalize errors and usage, and emit text-only stream events. Capability reporting is conservative: Ollama model-specific features come from `/api/show`; OpenAI-compatible discovery/usage features are explicit configuration choices. Current adapters do not expose chain-of-thought or vendor tool-call structures.
+
+Provider instances are persisted through the existing `ProviderRepository`. Only the credential reference and non-secret settings are stored; a reference can point to an environment variable or an OS credential backend. `EnvironmentCredentialStore` is read-only, `MemoryCredentialStore` is for tests/development, and `OsKeychainCredentialStore` delegates to a platform backend. No native Windows/macOS/Linux backend is shipped yet, so desktop code must supply one; there is no insecure plaintext fallback. The first implementation has no CLI package, so provider-management commands remain deferred until a CLI exists.
 
 ## Technology decisions
 

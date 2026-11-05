@@ -3,5 +3,9 @@ packages:
   - "packages/*"
 
 allowBuilds:
+  # Use the SDKs' published distributions; their lifecycle scripts are not required.
+  "@google/genai": false
   better-sqlite3: true
   esbuild: true
+  # protobufjs' optional postinstall only emits a version-scheme warning.
+  protobufjs: false

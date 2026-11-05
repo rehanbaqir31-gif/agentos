@@ -17,6 +17,9 @@ Threats include prompt injection, path traversal, unauthorized shell/network acc
 - Sensitive actions require an external approval decision recorded against the run; an agent cannot approve itself.
 - Keep secrets out of logs, ordinary database rows, command arguments where avoidable, and manifests. Mask captured output.
 - Domain schemas reject secret-named configuration fields and provider URLs containing embedded credentials; event serialization masks common token patterns. These checks are defense in depth and do not replace an OS-backed credential store or adapter output review.
+- Provider credentials are stored by reference. Environment references are resolved at request time and are read-only. OS credential operations require an injected keychain backend; no plaintext database or file fallback exists. The native platform backend is not yet implemented.
+- Provider URLs reject embedded credentials and permit plaintext HTTP only on loopback; remote endpoints must use HTTPS. This does not provide a general egress allowlist, DNS-rebinding defense, or network sandbox.
+- Provider errors are normalized without forwarding provider response bodies, request URLs, or credentials. Custom HTTP headers reject authentication/secret header names and secret-like values; authentication headers use a credential reference.
 - Persist run/event state and validate transitions; cancellation and cleanup must be safe and idempotent.
 - Validate adapter and provider configuration at boundaries; declare only verified capabilities.
 
@@ -24,7 +27,7 @@ Threats include prompt injection, path traversal, unauthorized shell/network acc
 
 Local single-user mode trusts the host account and operating system. Docker is defense in depth, not a complete isolation boundary; host kernel, daemon, image supply chain, and configuration remain in the trusted computing base. Sandbox guarantees must be documented per supported platform before autonomous execution is offered. The current environment has no Docker or Rust/Cargo, so container and Tauri verification are unavailable.
 
-SQLite is the only implemented database. PostgreSQL schema, transport and authorization behavior remain unimplemented and unverified.
+SQLite is the default local database and PostgreSQL is supported for servers. PostgreSQL 16 migrations and integration tests pass in CI. Provider connections are direct outbound HTTP requests from the host process; they do not yet enforce an egress allowlist or network sandbox. Configure trusted endpoints and restrict network access at the host/firewall layer.
 
 ## Verification plan
 
