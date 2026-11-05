@@ -1,0 +1,39 @@
+# Dependencies and generated build/test output
+node_modules/
+dist/
+build/
+coverage/
+.turbo/
+
+# Secrets and local environment configuration
+.env
+.env.*
+!.env.example
+.secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local AgentOS state and database files (including SQLite journals/WAL files)
+.agentos/
+data/
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+*.db
+*.db-*
+*.local.*
+
+# Local editor/OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+work/
+outputs/
+
+# Logs and temporary files
+*.log
+*.tmp

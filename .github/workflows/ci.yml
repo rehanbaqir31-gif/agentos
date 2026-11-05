@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: agentos
+          POSTGRES_PASSWORD: agentos_ci_password
+          POSTGRES_DB: agentos_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agentos -d agentos_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      AGENTOS_DATABASE_DRIVER: postgresql
+      AGENTOS_DATABASE_URL: postgresql://agentos:agentos_ci_password@127.0.0.1:5432/agentos_test
+      AGENTOS_POSTGRES_TEST_URL: postgresql://agentos:agentos_ci_password@127.0.0.1:5432/agentos_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check-types
+      - run: pnpm lint
+      - run: pnpm test
+      - name: Run PostgreSQL migrations and integration tests (PostgreSQL 16)
+        run: pnpm --filter @agentos/database test:postgres
+      - run: pnpm build
+      - run: pnpm format:check

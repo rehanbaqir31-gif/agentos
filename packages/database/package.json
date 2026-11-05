@@ -1,0 +1,32 @@
+{
+  "name": "@agentos/database",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check-types": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src test",
+    "test": "vitest run --exclude test/postgres.integration.test.ts",
+    "test:sqlite": "vitest run test/repositories.test.ts",
+    "test:postgres": "vitest run test/postgres.integration.test.ts"
+  },
+  "dependencies": {
+    "@agentos/core": "workspace:*",
+    "better-sqlite3": "^12.4.1",
+    "drizzle-orm": "^0.45.1",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.15",
+    "@electric-sql/pglite-socket": "^0.2.18",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/pg": "^8.23.1"
+  }
+}
