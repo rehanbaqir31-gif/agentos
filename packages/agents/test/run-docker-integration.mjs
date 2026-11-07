@@ -1,5 +1,4 @@
 import { execFile } from "node:child_process";
-import { console } from "node:console";
 import process from "node:process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -39,8 +38,10 @@ try {
   });
   if (exitCode !== 0) process.exitCode = Number(exitCode) || 1;
 } catch (error) {
-  console.error("Docker daemon integration requires a working Docker Engine and image build.");
-  console.error(error);
+  process.stderr.write(
+    "Docker daemon integration requires a working Docker Engine and image build.\n",
+  );
+  process.stderr.write(`${error}\n`);
   process.exitCode = 1;
 } finally {
   if (imageId) await exec("docker", ["image", "rm", "--force", imageId.trim()]).catch(() => {});
