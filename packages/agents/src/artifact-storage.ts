@@ -9,6 +9,7 @@ import {
   realpath,
   rm,
   unlink,
+  utimes,
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -28,6 +29,7 @@ export interface ArtifactObjectStorage {
   write(id: string, content: Uint8Array, maxBytes: number): Promise<StoredArtifactObject>;
   read(locator: string): Promise<Buffer>;
   remove(locator: string): Promise<void>;
+  deferRemove(locator: string, notBefore: Date): Promise<void>;
   cleanupAbandonedStaging(olderThan: Date): Promise<number>;
   cleanupOrphans(referencedLocators: readonly string[], olderThan: Date): Promise<number>;
 }
@@ -103,8 +105,16 @@ export class FileSystemArtifactStorage implements ArtifactObjectStorage {
       }
       const stagedBytes = await readFile(stagedPath);
       verifyBytes(stagedBytes, captured.byteLength, sha256);
-      await this.promote(stagedPath, objectPath);
-      promoted = true;
+      try {
+        await this.promote(stagedPath, objectPath);
+        promoted = true;
+      } catch (error) {
+        if (!isExists(error)) throw error;
+        const existing = await readFile(objectPath);
+        verifyBytes(existing, captured.byteLength, sha256);
+        await unlink(stagedPath);
+        return { locator, byteSize: captured.byteLength, sha256, truncated };
+      }
       const persisted = await readFile(objectPath);
       verifyBytes(persisted, captured.byteLength, sha256);
       return { locator, byteSize: captured.byteLength, sha256, truncated };
@@ -137,6 +147,18 @@ export class FileSystemArtifactStorage implements ArtifactObjectStorage {
       if (isMissing(error)) return;
       throw error;
     });
+  }
+
+  async deferRemove(locator: string, notBefore: Date): Promise<void> {
+    const objectPath = await this.objectPath(locator);
+    const info = await lstat(objectPath).catch((error: unknown) =>
+      isMissing(error) ? null : Promise.reject(error),
+    );
+    if (!info) return;
+    if (!info.isFile() || info.isSymbolicLink())
+      throw new Error("Artifact object is not a regular file");
+    const future = Math.max(Date.now(), notBefore.valueOf()) / 1000;
+    await utimes(objectPath, future, future);
   }
 
   async cleanupAbandonedStaging(olderThan: Date): Promise<number> {
@@ -221,4 +243,8 @@ async function assertWithin(root: string, target: string): Promise<void> {
 
 function isMissing(error: unknown): boolean {
   return Boolean(error && typeof error === "object" && "code" in error && error.code === "ENOENT");
+}
+
+function isExists(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
 }

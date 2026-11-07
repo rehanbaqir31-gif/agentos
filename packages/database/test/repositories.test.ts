@@ -93,11 +93,11 @@ describe("SQLite database and repositories", () => {
   it("initializes versioned schema and applies migrations only once", () => {
     expect(database.sqlite.pragma("foreign_keys", { simple: true })).toBe(1);
     expect(database.sqlite.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({
-      n: 3,
+      n: 4,
     });
     applyMigrations(database.sqlite, migrations);
     expect(database.sqlite.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({
-      n: 3,
+      n: 4,
     });
     expect(() =>
       applyMigrations(database.sqlite, [
@@ -107,6 +107,7 @@ describe("SQLite database and repositories", () => {
   });
 
   it("rolls back the additive approval migration only when no approval audit fields are populated", async () => {
+    expect(rollbackLastMigration(database.sqlite)).toBe(4);
     expect(rollbackLastMigration(database.sqlite)).toBe(3);
     expect(rollbackLastMigration(database.sqlite)).toBe(2);
     expect(database.sqlite.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({
@@ -127,6 +128,7 @@ describe("SQLite database and repositories", () => {
       policyVersion: "policy-v1",
       expiresAt: "2026-11-05T13:00:00.000Z",
     });
+    expect(rollbackLastMigration(database.sqlite)).toBe(4);
     expect(rollbackLastMigration(database.sqlite)).toBe(3);
     expect(() => rollbackLastMigration(database.sqlite)).toThrow(/discard approval audit state/);
     expect(database.sqlite.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({
@@ -594,5 +596,50 @@ describe("SQLite database and repositories", () => {
     expect(new Set(entries.map((entry) => entry.id)).size).toBe(12);
     expect(repositories.projects.list({ limit: 20 }).total).toBe(12);
     other.close();
+  });
+
+  it("allows one worker to claim a run and fences stale generations after takeover", async () => {
+    const { run } = await createFixture();
+    const first = await repositories.leases.claim(
+      run.id,
+      "worker-a",
+      fixedTime,
+      "2026-11-05T12:00:10.000Z",
+    );
+    expect(first?.lease.generation).toBe(1);
+    expect(
+      await repositories.leases.claim(run.id, "worker-b", fixedTime, "2026-11-05T12:00:10.000Z"),
+    ).toBeNull();
+    const takeover = await repositories.leases.claim(
+      run.id,
+      "worker-b",
+      "2026-11-05T12:00:11.000Z",
+      "2026-11-05T12:00:30.000Z",
+    );
+    expect(takeover?.previousGeneration).toBe(1);
+    expect(takeover?.lease.generation).toBe(2);
+    expect(
+      repositories.leases.release(run.id, { workerId: "worker-a", generation: 1 }, fixedTime),
+    ).toBe(false);
+    repositories.events.appendOwned(
+      { runId: run.id, type: "run.started", occurredAt: fixedTime, data: {} },
+      { workerId: "worker-b", generation: 2 },
+      "2026-11-05T12:00:12.000Z",
+    );
+    expect(() =>
+      repositories.events.appendOwned(
+        { runId: run.id, type: "run.started", occurredAt: fixedTime, data: {} },
+        { workerId: "worker-a", generation: 1 },
+        "2026-11-05T12:00:12.000Z",
+      ),
+    ).toThrow(/lease is stale/);
+    expect(() =>
+      repositories.runs.updateOwned(
+        run.id,
+        { error: "stale" },
+        { workerId: "worker-a", generation: 1 },
+        "2026-11-05T12:00:12.000Z",
+      ),
+    ).toThrow(/lease is stale/);
   });
 });

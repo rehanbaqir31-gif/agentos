@@ -205,4 +205,26 @@ DROP INDEX execution_runs_id_project_id_uq;
 `,
     rollbackCheckSql: "SELECT COUNT(*) AS count FROM run_artifacts",
   },
+  {
+    version: 4,
+    name: "durable_worker_run_leases",
+    sql: `
+CREATE TABLE run_leases (
+  run_id TEXT PRIMARY KEY NOT NULL REFERENCES execution_runs(id) ON DELETE RESTRICT,
+  worker_id TEXT NOT NULL CHECK (length(worker_id) BETWEEN 1 AND 256),
+  generation INTEGER NOT NULL CHECK (generation > 0),
+  claimed_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  released_at TEXT,
+  CHECK (heartbeat_at >= claimed_at),
+  CHECK (expires_at > claimed_at)
+);
+CREATE INDEX run_leases_expiration_idx ON run_leases(released_at, expires_at, run_id);
+`,
+    downSql: `
+DROP TABLE run_leases;
+`,
+    rollbackCheckSql: "SELECT COUNT(*) AS count FROM run_leases",
+  },
 ];

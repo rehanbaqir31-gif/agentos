@@ -204,7 +204,7 @@ describe("durable execution coordinator", () => {
         agentId: f.agent.id,
         runId,
       });
-      expect(outcome.run.status).toBe("succeeded");
+      expect(outcome.run.status, outcome.error ?? undefined).toBe("succeeded");
       expect(outcome.run.workspaceId).toBe(`C:\\isolated\\${runId}`);
       const manifest = await f.repositories.manifests.getByRunId(runId);
       expect(manifest).toMatchObject({

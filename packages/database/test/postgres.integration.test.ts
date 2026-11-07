@@ -131,7 +131,7 @@ describe(`PostgreSQL persistence (${testMode})`, () => {
     const rows = await database.pool.query(
       "SELECT version FROM schema_migrations ORDER BY version",
     );
-    expect(rows.rows).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+    expect(rows.rows).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
     await expect(
       applyPostgresMigrations(database.pool, [
         { ...postgresMigrations[0]!, sql: `${postgresMigrations[0]!.sql}\n-- changed` },
@@ -140,6 +140,7 @@ describe(`PostgreSQL persistence (${testMode})`, () => {
   });
 
   it("reverses the additive approval migration only before approval audit data is written", async () => {
+    expect(await rollbackLastPostgresMigration(database.pool)).toBe(4);
     expect(await rollbackLastPostgresMigration(database.pool)).toBe(3);
     expect(await rollbackLastPostgresMigration(database.pool)).toBe(2);
     const remaining = await database.pool.query(
@@ -161,6 +162,7 @@ describe(`PostgreSQL persistence (${testMode})`, () => {
       policyVersion: "policy-v1",
       expiresAt: "2026-11-05T13:00:00.000Z",
     });
+    expect(await rollbackLastPostgresMigration(database.pool)).toBe(4);
     expect(await rollbackLastPostgresMigration(database.pool)).toBe(3);
     await expect(rollbackLastPostgresMigration(database.pool)).rejects.toThrow(
       /discard approval audit state/,
@@ -186,6 +188,45 @@ describe(`PostgreSQL persistence (${testMode})`, () => {
       "SELECT version FROM schema_migrations WHERE version = 100",
     );
     expect(migration.rows).toHaveLength(0);
+  });
+
+  it("serializes concurrent lease claims and fences stale worker generations", async () => {
+    const { run } = await createFixture();
+    const expiration = "2026-11-05T12:00:10.000Z";
+    const claims = await Promise.all([
+      repositories.leases.claim(run.id, "worker-a", fixedTime, expiration),
+      repositories.leases.claim(run.id, "worker-b", fixedTime, expiration),
+    ]);
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    const owner = claims.find(Boolean)!;
+    const takeover = await repositories.leases.claim(
+      run.id,
+      "worker-c",
+      "2026-11-05T12:00:11.000Z",
+      "2026-11-05T12:00:30.000Z",
+    );
+    expect(takeover?.previousGeneration).toBe(owner.lease.generation);
+    expect(takeover?.lease.generation).toBe(owner.lease.generation + 1);
+    const identity = { workerId: takeover!.lease.workerId, generation: takeover!.lease.generation };
+    await repositories.events.appendOwned(
+      { runId: run.id, type: "run.started", occurredAt: fixedTime, data: {} },
+      identity,
+      "2026-11-05T12:00:12.000Z",
+    );
+    await expect(
+      repositories.events.appendOwned(
+        { runId: run.id, type: "run.started", occurredAt: fixedTime, data: {} },
+        { workerId: owner.lease.workerId, generation: owner.lease.generation },
+        "2026-11-05T12:00:12.000Z",
+      ),
+    ).rejects.toThrow(/lease is stale/);
+    const updated = await repositories.runs.updateOwned(
+      run.id,
+      { status: "validating" },
+      identity,
+      "2026-11-05T12:00:12.000Z",
+    );
+    expect(updated.status).toBe("validating");
   });
 
   it("creates and retrieves projects, agents, providers, tasks, and runs", async () => {

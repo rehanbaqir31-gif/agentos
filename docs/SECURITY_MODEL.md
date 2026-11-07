@@ -4,6 +4,8 @@
 
 Assets include source code, credentials, local files, execution history, provider usage, and approval decisions. Treat tasks/prompts, repository content, model output, adapters, MCP servers, and tool output as untrusted. Trust boundaries exist between clients and API, coordinator and worker, worker and host, adapter and provider, and each project/run workspace.
 
+Worker ownership is represented by a durable run lease and monotonic fencing generation. Claim/renew/release operations require matching worker and generation; recovery acts only after claiming an expired/released lease and cleans resources labeled with the prior generation. Prompts are never automatically replayed and existing artifacts are retained. Lease timeout is not proof of process death, so writes must fail closed after fencing. PostgreSQL 16 CI is required to verify server row-lock behavior; PGlite is a local development aid only.
+
 ## Threats
 
 Threats include prompt injection, path traversal, unauthorized shell/network access, secret exfiltration, malicious integrations, cross-project access, resource exhaustion, unsafe cleanup, and local service exposure.

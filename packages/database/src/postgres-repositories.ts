@@ -19,6 +19,9 @@ import type {
   Provider,
   RunManifest,
   RunArtifact,
+  WorkerLease,
+  RunLeaseIdentity,
+  LeaseClaim,
   CreateRunArtifact,
   Task,
   RepositorySet,
@@ -52,6 +55,7 @@ import {
   runArtifactSchema,
   taskSchema,
   transitionRun,
+  workerLeaseSchema,
 } from "@agentos/core";
 import type { AgentOsPostgresDatabase } from "./postgres-database.js";
 import {
@@ -65,6 +69,7 @@ import {
   pgRunEventCounters,
   pgRunManifests,
   pgRunArtifacts,
+  pgRunLeases,
   pgTasks,
 } from "./postgres-schema.js";
 import {
@@ -75,6 +80,40 @@ import {
   RepositoryNotFoundError,
   translateError,
 } from "./repository-common.js";
+
+async function withPostgresLease<T>(
+  database: AgentOsPostgresDatabase,
+  runId: string,
+  identity: RunLeaseIdentity,
+  now: string,
+  operation: (client: import("pg").PoolClient) => Promise<T>,
+): Promise<T> {
+  return database.transaction(async (client) => {
+    const result = await client.query<{
+      worker_id: string;
+      generation: string;
+      expires_at: Date | string;
+      released_at: Date | null;
+    }>(
+      "SELECT worker_id,generation,expires_at,released_at FROM run_leases WHERE run_id=$1 FOR UPDATE",
+      [runId],
+    );
+    const lease = result.rows[0];
+    const expiry =
+      lease?.expires_at instanceof Date
+        ? lease.expires_at.getTime()
+        : new Date(String(lease?.expires_at)).getTime();
+    if (
+      !lease ||
+      lease.worker_id !== identity.workerId ||
+      Number(lease.generation) !== identity.generation ||
+      lease.released_at !== null ||
+      expiry <= new Date(now).getTime()
+    )
+      throw new RepositoryConflictError("Worker lease is stale or no longer owns this run");
+    return operation(client);
+  });
+}
 
 function assertNotCancelled(isCancelled?: () => boolean): void {
   if (isCancelled?.()) throw new RepositoryConflictError("Authorization was cancelled");
@@ -97,6 +136,29 @@ function normalizeTimestamps<T>(value: T): T {
     }
   }
   return normalized as T;
+}
+
+function pgExecutionRun(row: Record<string, unknown>): ExecutionRun {
+  const iso = (value: unknown) =>
+    value instanceof Date ? value.toISOString() : new Date(String(value)).toISOString();
+  return executionRunSchema.parse({
+    id: row["id"],
+    taskId: row["task_id"],
+    projectId: row["project_id"],
+    agentId: row["agent_id"],
+    adapterVersion: row["adapter_version"],
+    providerId: row["provider_id"],
+    modelId: row["model_id"],
+    status: row["status"],
+    manifestId: row["manifest_id"],
+    workspaceId: row["workspace_id"],
+    startedAt: row["started_at"] === null ? null : iso(row["started_at"]),
+    completedAt: row["completed_at"] === null ? null : iso(row["completed_at"]),
+    error: row["error"],
+    usageMetrics: row["usage_metrics"],
+    createdAt: iso(row["created_at"]),
+    updatedAt: iso(row["updated_at"]),
+  });
 }
 
 function page<T>(items: T[], total: number, input: PageRequest): Page<T> {
@@ -460,6 +522,108 @@ export class PostgresTaskRepository {
 
 export class PostgresExecutionRunRepository {
   constructor(private readonly database: AgentOsPostgresDatabase) {}
+  async createWithLease(
+    input: CreateExecutionRun,
+    workerId: string,
+    claimedAt: string,
+    expiresAt: string,
+    id = randomUUID(),
+  ) {
+    const value = executionRunSchema.parse({
+      ...createExecutionRunSchema.parse(input),
+      id,
+      createdAt: claimedAt,
+      updatedAt: claimedAt,
+    });
+    if (value.status !== "created" || value.manifestId !== null)
+      throw new RelationshipValidationError("New runs must begin created without a manifest");
+    return this.database.orm.transaction(async (tx) => {
+      const task = (
+        await tx.select().from(pgTasks).where(eq(pgTasks.id, value.taskId)).limit(1)
+      )[0];
+      if (!task || task.projectId !== value.projectId)
+        throw new RelationshipValidationError("Run task must belong to its project");
+      if (task.assignedAgentId && task.assignedAgentId !== value.agentId)
+        throw new RelationshipValidationError("Run agent differs from the task assignment");
+      await tx.insert(pgExecutionRuns).values(value);
+      await tx.insert(pgRunLeases).values({
+        runId: id,
+        workerId,
+        generation: 1,
+        claimedAt,
+        heartbeatAt: claimedAt,
+        expiresAt,
+        releasedAt: null,
+      });
+      return {
+        run: value,
+        lease: workerLeaseSchema.parse({
+          runId: id,
+          workerId,
+          generation: 1,
+          claimedAt,
+          heartbeatAt: claimedAt,
+          expiresAt,
+          releasedAt: null,
+        }),
+      };
+    });
+  }
+  async updateOwned(
+    id: string,
+    patch: Partial<Omit<ExecutionRun, "id" | "createdAt" | "updatedAt">>,
+    identity: RunLeaseIdentity,
+    now: string,
+  ): Promise<ExecutionRun> {
+    await withPostgresLease(this.database, id, identity, now, async (client) => {
+      const selected = await client.query<Record<string, unknown>>(
+        "SELECT * FROM execution_runs WHERE id=$1 FOR UPDATE",
+        [id],
+      );
+      if (!selected.rows[0]) throw new RepositoryNotFoundError("Execution run", id);
+      const current = pgExecutionRun(selected.rows[0]);
+      const value = executionRunSchema.parse({ ...current, ...patch, updatedAt: now });
+      if (value.status !== current.status) transitionRun(current.status, value.status);
+      if (value.manifestId !== current.manifestId)
+        throw new RelationshipValidationError(
+          "Only the manifest repository can link a run manifest",
+        );
+      if (
+        current.manifestId !== null &&
+        (value.taskId !== current.taskId ||
+          value.projectId !== current.projectId ||
+          value.agentId !== current.agentId ||
+          value.adapterVersion !== current.adapterVersion ||
+          value.providerId !== current.providerId ||
+          value.modelId !== current.modelId)
+      )
+        throw new RelationshipValidationError(
+          "Run identity cannot change after its manifest is stored",
+        );
+      await client.query(
+        `UPDATE execution_runs SET task_id=$1,project_id=$2,agent_id=$3,adapter_version=$4,provider_id=$5,model_id=$6,status=$7,manifest_id=$8,workspace_id=$9,started_at=$10,completed_at=$11,error=$12,usage_metrics=$13,updated_at=$14 WHERE id=$15 AND status=$16`,
+        [
+          value.taskId,
+          value.projectId,
+          value.agentId,
+          value.adapterVersion,
+          value.providerId,
+          value.modelId,
+          value.status,
+          value.manifestId,
+          value.workspaceId,
+          value.startedAt,
+          value.completedAt,
+          value.error,
+          JSON.stringify(value.usageMetrics),
+          value.updatedAt,
+          id,
+          current.status,
+        ],
+      );
+    });
+    return this.getById(id);
+  }
   async create(input: CreateExecutionRun, id = randomUUID()): Promise<ExecutionRun> {
     const now = this.database.now();
     const value = executionRunSchema.parse({
@@ -586,8 +750,158 @@ export class PostgresExecutionRunRepository {
   }
 }
 
+export class PostgresRunLeaseRepository {
+  constructor(private readonly database: AgentOsPostgresDatabase) {}
+  async claim(
+    runId: string,
+    workerId: string,
+    now: string,
+    expiresAt: string,
+  ): Promise<LeaseClaim | null> {
+    return this.database.transaction(async (client) => {
+      await client.query("SELECT id FROM execution_runs WHERE id=$1 FOR UPDATE", [runId]);
+      const selected = await client.query<Record<string, unknown>>(
+        "SELECT * FROM run_leases WHERE run_id=$1 FOR UPDATE",
+        [runId],
+      );
+      const prior = selected.rows[0];
+      if (
+        prior &&
+        prior["released_at"] === null &&
+        new Date(prior["expires_at"] as string).getTime() > new Date(now).getTime()
+      )
+        return null;
+      const previousGeneration = prior ? Number(prior["generation"]) : null;
+      const generation = (previousGeneration ?? 0) + 1;
+      const result = await client.query<Record<string, unknown>>(
+        `INSERT INTO run_leases(run_id,worker_id,generation,claimed_at,heartbeat_at,expires_at,released_at)
+        VALUES($1,$2,$3,$4,$4,$5,NULL) ON CONFLICT(run_id) DO UPDATE SET worker_id=excluded.worker_id,
+        generation=excluded.generation,claimed_at=excluded.claimed_at,heartbeat_at=excluded.heartbeat_at,
+        expires_at=excluded.expires_at,released_at=NULL RETURNING *`,
+        [runId, workerId, generation, now, expiresAt],
+      );
+      return { lease: pgLease(result.rows[0]!), previousGeneration };
+    });
+  }
+  async renew(
+    runId: string,
+    identity: RunLeaseIdentity,
+    now: string,
+    expiresAt: string,
+  ): Promise<WorkerLease | null> {
+    const result = await this.database.pool.query<Record<string, unknown>>(
+      `UPDATE run_leases SET heartbeat_at=$1,expires_at=$2 WHERE run_id=$3 AND worker_id=$4 AND generation=$5 AND released_at IS NULL AND expires_at>$1 RETURNING *`,
+      [now, expiresAt, runId, identity.workerId, identity.generation],
+    );
+    return result.rows[0] ? pgLease(result.rows[0]) : null;
+  }
+  async release(runId: string, identity: RunLeaseIdentity, at: string): Promise<boolean> {
+    const result = await this.database.pool.query(
+      `UPDATE run_leases SET released_at=$1 WHERE run_id=$2 AND worker_id=$3 AND generation=$4 AND released_at IS NULL`,
+      [at, runId, identity.workerId, identity.generation],
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+  async getByRunId(runId: string): Promise<WorkerLease | null> {
+    const result = await this.database.pool.query<Record<string, unknown>>(
+      "SELECT * FROM run_leases WHERE run_id=$1",
+      [runId],
+    );
+    return result.rows[0] ? pgLease(result.rows[0]) : null;
+  }
+  async listExpired(now: string, input: PageRequest = {}): Promise<Page<WorkerLease>> {
+    const { limit, offset } = pageRequest(input);
+    const [rows, total] = await Promise.all([
+      this.database.pool.query<Record<string, unknown>>(
+        "SELECT * FROM run_leases WHERE released_at IS NOT NULL OR expires_at <= $1 ORDER BY expires_at,run_id LIMIT $2 OFFSET $3",
+        [now, limit, offset],
+      ),
+      this.database.pool.query<{ count: string }>(
+        "SELECT count(*) FROM run_leases WHERE released_at IS NOT NULL OR expires_at <= $1",
+        [now],
+      ),
+    ]);
+    return {
+      items: rows.rows.map(pgLease),
+      total: Number(total.rows[0]?.count ?? 0),
+      limit,
+      offset,
+    };
+  }
+}
+
+function pgLease(row: Record<string, unknown>): WorkerLease {
+  const asIso = (value: unknown) =>
+    value instanceof Date ? value.toISOString() : new Date(String(value)).toISOString();
+  return workerLeaseSchema.parse({
+    runId: row["run_id"],
+    workerId: row["worker_id"],
+    generation: Number(row["generation"]),
+    claimedAt: asIso(row["claimed_at"]),
+    heartbeatAt: asIso(row["heartbeat_at"]),
+    expiresAt: asIso(row["expires_at"]),
+    releasedAt: row["released_at"] === null ? null : asIso(row["released_at"]),
+  });
+}
+
 export class PostgresRunManifestRepository {
   constructor(private readonly database: AgentOsPostgresDatabase) {}
+  async createOwned(
+    input: CreateRunManifest,
+    identity: RunLeaseIdentity,
+    now: string,
+    id = randomUUID(),
+  ): Promise<RunManifest> {
+    const value = runManifestSchema.parse({
+      ...createRunManifestSchema.parse(input),
+      id,
+      createdAt: now,
+    });
+    await withPostgresLease(this.database, input.runId, identity, now, async (client) => {
+      const run = await client.query<{
+        agent_id: string;
+        provider_id: string | null;
+        manifest_id: string | null;
+      }>("SELECT agent_id,provider_id,manifest_id FROM execution_runs WHERE id=$1 FOR UPDATE", [
+        input.runId,
+      ]);
+      const row = run.rows[0];
+      if (
+        !row ||
+        row.agent_id !== input.agentId ||
+        row.provider_id !== input.providerId ||
+        row.manifest_id !== null
+      )
+        throw new RelationshipValidationError("Manifest identities must match an unmanifested run");
+      await client.query(
+        `INSERT INTO run_manifests(id,version,run_id,agent_id,agent_name,adapter_id,adapter_version,provider_id,model_id,prompt_configuration_hash,repository_commit_sha,tool_versions,skill_versions,runtime_configuration,permission_configuration,environment_variable_names,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14::jsonb,$15::jsonb,$16::jsonb,$17)`,
+        [
+          value.id,
+          value.version,
+          value.runId,
+          value.agentId,
+          value.agentName,
+          value.adapterId,
+          value.adapterVersion,
+          value.providerId,
+          value.modelId,
+          value.promptConfigurationHash,
+          value.repositoryCommitSha,
+          JSON.stringify(value.toolVersions),
+          JSON.stringify(value.skillVersions),
+          JSON.stringify(value.runtimeConfiguration),
+          JSON.stringify(value.permissionConfiguration),
+          JSON.stringify(value.environmentVariableNames),
+          value.createdAt,
+        ],
+      );
+      await client.query(
+        "UPDATE execution_runs SET manifest_id=$1,updated_at=$2 WHERE id=$3 AND manifest_id IS NULL",
+        [value.id, now, value.runId],
+      );
+    });
+    return this.getByRunId(input.runId);
+  }
   async create(input: CreateRunManifest, id = randomUUID()): Promise<RunManifest> {
     const value = runManifestSchema.parse({
       ...createRunManifestSchema.parse(input),
@@ -648,6 +962,42 @@ export class PostgresRunManifestRepository {
 
 export class PostgresRunArtifactRepository {
   constructor(private readonly database: AgentOsPostgresDatabase) {}
+  async createOwned(
+    input: CreateRunArtifact,
+    identity: RunLeaseIdentity,
+    now: string,
+    id = randomUUID(),
+  ): Promise<RunArtifact> {
+    const value = runArtifactSchema.parse({
+      ...createRunArtifactSchema.parse(input),
+      id,
+      createdAt: now,
+    });
+    try {
+      return await withPostgresLease(this.database, input.runId, identity, now, async (client) => {
+        const result = await client.query<Record<string, unknown>>(
+          "INSERT INTO run_artifacts(id,run_id,project_id,artifact_type,logical_name,content_type,byte_size,sha256,created_at,storage_locator,collection_status,collection_error) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *",
+          [
+            value.id,
+            value.runId,
+            value.projectId,
+            value.type,
+            value.logicalName,
+            value.contentType,
+            value.byteSize,
+            value.sha256,
+            value.createdAt,
+            value.storageLocator,
+            value.collectionStatus,
+            value.collectionError,
+          ],
+        );
+        return runArtifactSchema.parse(normalizeTimestamps(result.rows[0]));
+      });
+    } catch (error) {
+      return translateError(error);
+    }
+  }
 
   async create(input: CreateRunArtifact, id = randomUUID()): Promise<RunArtifact> {
     const value = runArtifactSchema.parse({
@@ -765,6 +1115,70 @@ export class PostgresRunArtifactRepository {
 
 export class PostgresAgentEventRepository {
   constructor(private readonly database: AgentOsPostgresDatabase) {}
+  async appendOwned(
+    input: CreateAgentEvent,
+    identity: RunLeaseIdentity,
+    now: string,
+    id = randomUUID(),
+  ): Promise<AgentEvent> {
+    const base = createAgentEventSchema.parse(redactEventSecrets(input));
+    try {
+      return await withPostgresLease(this.database, input.runId, identity, now, async (client) => {
+        const prior = await client.query<Record<string, unknown>>(
+          "SELECT id,run_id,sequence,type,occurred_at,data FROM agent_events WHERE id=$1",
+          [id],
+        );
+        if (prior.rows[0]) {
+          const row = prior.rows[0];
+          if (row["run_id"] !== input.runId)
+            throw new RepositoryConflictError("Event identifier is already bound to another run");
+          return agentEventSchema.parse({
+            ...normalizeTimestamps(row),
+            runId: row["run_id"],
+            occurredAt: normalizeTimestamps(row)["occurred_at"],
+            data: row["data"],
+          });
+        }
+        const [counter] = (
+          await client.query<{ last_sequence: number }>(
+            `INSERT INTO run_event_counters(run_id,last_sequence) VALUES($1,1) ON CONFLICT(run_id) DO UPDATE SET last_sequence=run_event_counters.last_sequence+1 RETURNING last_sequence`,
+            [base.runId],
+          )
+        ).rows;
+        if (!counter) throw new Error("Could not allocate event sequence");
+        const event = agentEventSchema.parse({ ...base, id, sequence: counter.last_sequence });
+        const inserted = await client.query(
+          "INSERT INTO agent_events(id,run_id,sequence,type,occurred_at,data) VALUES($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT(id) DO NOTHING RETURNING id",
+          [
+            event.id,
+            event.runId,
+            event.sequence,
+            event.type,
+            event.occurredAt,
+            JSON.stringify(event.data),
+          ],
+        );
+        if (!inserted.rows.length) {
+          const existing = await client.query<Record<string, unknown>>(
+            "SELECT id,run_id,sequence,type,occurred_at,data FROM agent_events WHERE id=$1",
+            [id],
+          );
+          const row = existing.rows[0];
+          if (!row || row["run_id"] !== input.runId)
+            throw new RepositoryConflictError("Event identifier is already bound to another run");
+          return agentEventSchema.parse({
+            ...normalizeTimestamps(row),
+            runId: row["run_id"],
+            occurredAt: normalizeTimestamps(row)["occurred_at"],
+            data: row["data"],
+          });
+        }
+        return event;
+      });
+    } catch (error) {
+      return translateError(error);
+    }
+  }
   async append(input: CreateAgentEvent, id = randomUUID()): Promise<AgentEvent> {
     const base = createAgentEventSchema.parse(redactEventSecrets(input));
     try {
@@ -818,6 +1232,66 @@ export class PostgresAgentEventRepository {
 
 export class PostgresApprovalRepository {
   constructor(private readonly database: AgentOsPostgresDatabase) {}
+  async createOwned(
+    input: CreateApproval,
+    identity: RunLeaseIdentity,
+    now: string,
+    id = randomUUID(),
+  ): Promise<Approval> {
+    const value = approvalSchema.parse({ ...createApprovalSchema.parse(input), id });
+    try {
+      const row = await withPostgresLease(
+        this.database,
+        input.runId,
+        identity,
+        now,
+        async (client) => {
+          const result = await client.query<Record<string, unknown>>(
+            "INSERT INTO approvals(id,run_id,action_type,action_description,requested_permissions,status,requested_at,resolved_at,resolved_by,principal_id,policy_version,expires_at,consumed_at,revoked_at) VALUES($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *",
+            [
+              value.id,
+              value.runId,
+              value.actionType,
+              value.actionDescription,
+              JSON.stringify(value.requestedPermissions),
+              value.status,
+              value.requestedAt,
+              value.resolvedAt,
+              value.resolvedBy,
+              value.principalId,
+              value.policyVersion,
+              value.expiresAt,
+              value.consumedAt,
+              value.revokedAt,
+            ],
+          );
+          return result.rows[0];
+        },
+      );
+      return approvalSchema.parse(normalizeTimestamps(row));
+    } catch (error) {
+      return translateError(error);
+    }
+  }
+  async resolveOwned(
+    id: string,
+    status: "approved" | "rejected",
+    resolvedBy: string,
+    identity: RunLeaseIdentity,
+    now: string,
+  ): Promise<Approval> {
+    if (status === "approved")
+      throw new RepositoryConflictError("Approvals require the trusted server-side policy service");
+    const approval = await this.getById(id);
+    return withPostgresLease(this.database, approval.runId, identity, now, async (client) => {
+      const result = await client.query<Record<string, unknown>>(
+        "UPDATE approvals SET status=$1,resolved_at=$2,resolved_by=$3 WHERE id=$4 AND status='pending' RETURNING *",
+        [status, now, resolvedBy, id],
+      );
+      if (!result.rows[0]) throw new RepositoryConflictError("Approval is already resolved");
+      return approvalSchema.parse(normalizeTimestamps(result.rows[0]));
+    });
+  }
   async create(input: CreateApproval, id = randomUUID()): Promise<Approval> {
     const value = approvalSchema.parse({ ...createApprovalSchema.parse(input), id });
     if (
@@ -1034,6 +1508,7 @@ export class PostgresRepositories implements RepositorySet {
   readonly providers: PostgresProviderRepository;
   readonly tasks: PostgresTaskRepository;
   readonly runs: PostgresExecutionRunRepository;
+  readonly leases: PostgresRunLeaseRepository;
   readonly manifests: PostgresRunManifestRepository;
   readonly artifacts: PostgresRunArtifactRepository;
   readonly events: PostgresAgentEventRepository;
@@ -1046,6 +1521,7 @@ export class PostgresRepositories implements RepositorySet {
     this.providers = new PostgresProviderRepository(database);
     this.tasks = new PostgresTaskRepository(database);
     this.runs = new PostgresExecutionRunRepository(database);
+    this.leases = new PostgresRunLeaseRepository(database);
     this.manifests = new PostgresRunManifestRepository(database);
     this.artifacts = new PostgresRunArtifactRepository(database);
     this.events = new PostgresAgentEventRepository(database);

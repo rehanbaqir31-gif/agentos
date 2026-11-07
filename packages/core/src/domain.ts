@@ -216,6 +216,44 @@ export const createExecutionRunSchema = executionRunBaseSchema.omit({
 });
 export type CreateExecutionRun = z.input<typeof createExecutionRunSchema>;
 
+export const workerIdSchema = z.string().trim().min(1).max(256);
+export const leaseGenerationSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+export const runLeaseIdentitySchema = z
+  .object({ workerId: workerIdSchema, generation: leaseGenerationSchema })
+  .strict();
+export type RunLeaseIdentity = z.infer<typeof runLeaseIdentitySchema>;
+export const workerLeaseSchema = z
+  .object({
+    runId: runIdSchema,
+    workerId: workerIdSchema,
+    generation: leaseGenerationSchema,
+    claimedAt: timestamp,
+    heartbeatAt: timestamp,
+    expiresAt: timestamp,
+    releasedAt: timestamp.nullable(),
+  })
+  .strict()
+  .superRefine((lease, context) => {
+    if (Date.parse(lease.heartbeatAt) < Date.parse(lease.claimedAt))
+      context.addIssue({
+        code: "custom",
+        path: ["heartbeatAt"],
+        message: "Heartbeat precedes claim",
+      });
+    if (Date.parse(lease.expiresAt) <= Date.parse(lease.claimedAt))
+      context.addIssue({
+        code: "custom",
+        path: ["expiresAt"],
+        message: "Lease expiry must follow claim",
+      });
+  });
+export type WorkerLease = z.infer<typeof workerLeaseSchema>;
+export interface LeaseClaim {
+  lease: WorkerLease;
+  /** The expired/released generation whose resources may be reconciled by this claim. */
+  previousGeneration: number | null;
+}
+
 export const runManifestSchema = z
   .object({
     id: runManifestIdSchema,

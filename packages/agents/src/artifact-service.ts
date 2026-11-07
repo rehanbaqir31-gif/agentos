@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
   createRunArtifactSchema,
   redactEventSecrets,
@@ -7,8 +7,10 @@ import {
   type RunArtifact,
   type RunManifest,
   type RepositorySet,
+  type RunLeaseIdentity,
 } from "@agentos/core";
 import { ArtifactStorageError, type ArtifactObjectStorage } from "./artifact-storage.js";
+import { RepositoryConflictError } from "@agentos/database";
 import type { AgentResult } from "./contracts.js";
 
 export interface ArtifactServiceOptions {
@@ -38,6 +40,17 @@ const sensitiveKey =
   /(?:api[_-]?key|private[_-]?key|password|secret|token|credential|authorization|^env$|^environment$)/i;
 const defaultArtifactBytes = 5 * 1024 * 1024;
 const defaultRunBytes = 25 * 1024 * 1024;
+
+function deterministicArtifactId(runId: string, type: string, logicalName: string): string {
+  const bytes = createHash("sha256")
+    .update(`agentos-artifact-v1:${runId}:${type}:${logicalName}`)
+    .digest()
+    .subarray(0, 16);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 
 /** Coordinates immutable object writes with scoped, durable metadata. */
 export class ArtifactService {
@@ -74,6 +87,7 @@ export class ArtifactService {
     projectId: string,
     manifest: RunManifest,
     result: AgentResult,
+    identity?: RunLeaseIdentity,
   ): Promise<ArtifactCaptureResult> {
     return this.withRunLock(runId, async () => {
       const existingPage = await this.repositories.artifacts.listForProject(runId, projectId, {
@@ -101,19 +115,17 @@ export class ArtifactService {
         }
         if (plan.content === null) {
           const failed = plan.failureReason !== null;
-          const artifact = await this.repositories.artifacts.create(
-            this.metadataInput(runId, projectId, plan, {
-              byteSize: 0,
-              sha256: null,
-              storageLocator: null,
-              collectionStatus: failed ? "failed" : "unavailable",
-              collectionError:
-                plan.failureReason ??
-                plan.unavailableReason ??
-                "Adapter did not provide this artifact",
-            }),
-            plan.id,
-          );
+          const artifactInput = this.metadataInput(runId, projectId, plan, {
+            byteSize: 0,
+            sha256: null,
+            storageLocator: null,
+            collectionStatus: failed ? "failed" : "unavailable",
+            collectionError:
+              plan.failureReason ??
+              plan.unavailableReason ??
+              "Adapter did not provide this artifact",
+          });
+          const artifact = await this.persistMetadata(artifactInput, plan.id, identity);
           artifacts.push(artifact);
           if (failed) failures.push(`${plan.type}: ${plan.failureReason}`);
           continue;
@@ -123,36 +135,26 @@ export class ArtifactService {
         const allowedBytes = Math.min(this.maxArtifactBytes, remaining);
         try {
           const stored = await this.storage.write(plan.id, plan.content, allowedBytes);
-          let artifact: RunArtifact;
-          try {
-            artifact = await this.repositories.artifacts.create(
-              this.metadataInput(runId, projectId, plan, {
-                byteSize: stored.byteSize,
-                sha256: stored.sha256,
-                storageLocator: stored.locator,
-                collectionStatus: stored.truncated ? "truncated" : "complete",
-                collectionError: null,
-              }),
-              plan.id,
-            );
-          } catch (error) {
-            await this.storage.remove(stored.locator).catch(() => undefined);
-            throw error;
-          }
+          const artifactInput = this.metadataInput(runId, projectId, plan, {
+            byteSize: stored.byteSize,
+            sha256: stored.sha256,
+            storageLocator: stored.locator,
+            collectionStatus: stored.truncated ? "truncated" : "complete",
+            collectionError: null,
+          });
+          const artifact = await this.persistMetadata(artifactInput, plan.id, identity);
           artifacts.push(artifact);
           usedBytes += artifact.byteSize;
         } catch (error) {
           if (error instanceof ArtifactStorageError) {
-            const failed = await this.repositories.artifacts.create(
-              this.metadataInput(runId, projectId, plan, {
-                byteSize: error.capturedByteSize,
-                sha256: error.capturedSha256,
-                storageLocator: null,
-                collectionStatus: "failed",
-                collectionError: safeError(error.message),
-              }),
-              plan.id,
-            );
+            const failedInput = this.metadataInput(runId, projectId, plan, {
+              byteSize: error.capturedByteSize,
+              sha256: error.capturedSha256,
+              storageLocator: null,
+              collectionStatus: "failed",
+              collectionError: safeError(error.message),
+            });
+            const failed = await this.persistMetadata(failedInput, plan.id, identity);
             artifacts.push(failed);
             failures.push(`${plan.type}: ${safeError(error.message)}`);
             continue;
@@ -198,7 +200,11 @@ export class ArtifactService {
       for (const item of page.items) {
         const removed = await this.repositories.artifacts.delete(item.id);
         if (!removed) continue;
-        if (removed.storageLocator) await this.storage.remove(removed.storageLocator);
+        if (removed.storageLocator)
+          await this.storage.deferRemove(
+            removed.storageLocator,
+            new Date(now.valueOf() + this.orphanGraceMs),
+          );
         expired += 1;
       }
     }
@@ -228,8 +234,7 @@ export class ArtifactService {
     ): ArtifactPlan => ({
       id:
         existing.get(`${type}:${logicalName}`)?.id ??
-        // UUID randomness prevents the storage key from revealing run/project identifiers.
-        randomUUID(),
+        deterministicArtifactId(runId, type, logicalName),
       type,
       logicalName,
       contentType,
@@ -322,6 +327,37 @@ export class ArtifactService {
       contentType: plan.contentType,
       ...values,
     });
+  }
+
+  private async persistMetadata(
+    input: CreateRunArtifact,
+    id: string,
+    identity?: RunLeaseIdentity,
+  ): Promise<RunArtifact> {
+    try {
+      return identity
+        ? await this.repositories.artifacts.createOwned(input, identity, this.now(), id)
+        : await this.repositories.artifacts.create(input, id);
+    } catch (error) {
+      if (!(error instanceof RepositoryConflictError)) throw error;
+      const existing = await this.repositories.artifacts.getForProject(
+        input.runId,
+        input.projectId,
+        id,
+      );
+      if (
+        existing.type !== input.type ||
+        existing.logicalName !== input.logicalName ||
+        existing.byteSize !== input.byteSize ||
+        existing.sha256 !== input.sha256 ||
+        existing.collectionStatus !== input.collectionStatus ||
+        existing.storageLocator !== input.storageLocator
+      )
+        throw new Error(
+          "Concurrent artifact capture produced conflicting content for one logical artifact",
+        );
+      return existing;
+    }
   }
 
   private async withRunLock<T>(runId: string, operation: () => Promise<T>): Promise<T> {

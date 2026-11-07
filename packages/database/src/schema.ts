@@ -16,6 +16,7 @@ import type {
   Project,
   Provider,
   RunManifest,
+  WorkerLease,
   Task,
 } from "@agentos/core";
 
@@ -150,6 +151,27 @@ export const executionRuns = sqliteTable(
     index("execution_runs_project_created_idx").on(table.projectId, table.createdAt),
     index("execution_runs_task_idx").on(table.taskId),
     uniqueIndex("execution_runs_id_project_id_uq").on(table.id, table.projectId),
+  ],
+);
+
+export const runLeases = sqliteTable(
+  "run_leases",
+  {
+    runId: text("run_id")
+      .primaryKey()
+      .references(() => executionRuns.id, { onDelete: "restrict" }),
+    workerId: text("worker_id").notNull(),
+    generation: integer("generation").$type<WorkerLease["generation"]>().notNull(),
+    claimedAt: text("claimed_at").notNull(),
+    heartbeatAt: text("heartbeat_at").notNull(),
+    expiresAt: text("expires_at").notNull(),
+    releasedAt: text("released_at"),
+  },
+  (table) => [
+    check("run_leases_generation_check", sql`${table.generation} > 0`),
+    check("run_leases_heartbeat_check", sql`${table.heartbeatAt} >= ${table.claimedAt}`),
+    check("run_leases_expiry_check", sql`${table.expiresAt} > ${table.claimedAt}`),
+    index("run_leases_expiration_idx").on(table.releasedAt, table.expiresAt, table.runId),
   ],
 );
 
@@ -325,10 +347,14 @@ export const executionRunsRelations = relations(executionRuns, ({ one, many }) =
   events: many(agentEvents),
   approvals: many(approvals),
   artifacts: many(runArtifacts),
+  lease: one(runLeases),
   evaluations: many(evaluations),
 }));
 export const runManifestsRelations = relations(runManifests, ({ one }) => ({
   run: one(executionRuns, { fields: [runManifests.runId], references: [executionRuns.id] }),
+}));
+export const runLeasesRelations = relations(runLeases, ({ one }) => ({
+  run: one(executionRuns, { fields: [runLeases.runId], references: [executionRuns.id] }),
 }));
 export const agentEventsRelations = relations(agentEvents, ({ one }) => ({
   run: one(executionRuns, { fields: [agentEvents.runId], references: [executionRuns.id] }),

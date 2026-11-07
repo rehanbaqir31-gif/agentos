@@ -46,6 +46,25 @@ describe("filesystem artifact object storage", () => {
     }
   });
 
+  it("reuses only identical immutable objects and defers deletion through the grace window", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentos-artifact-idempotence-"));
+    try {
+      const storage = await FileSystemArtifactStorage.open({ rootDirectory: root });
+      const id = randomUUID();
+      const first = await storage.write(id, Buffer.from("stable"), 100);
+      expect(await storage.write(id, Buffer.from("stable"), 100)).toEqual(first);
+      await expect(storage.write(id, Buffer.from("different"), 100)).rejects.toBeInstanceOf(
+        ArtifactStorageError,
+      );
+      const notBefore = new Date(Date.now() + 60_000);
+      await storage.deferRemove(first.locator, notBefore);
+      expect(await storage.cleanupOrphans([], new Date(Date.now() + 1_000))).toBe(0);
+      expect(await storage.read(first.locator)).toEqual(Buffer.from("stable"));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("cleans abandoned staging files and unreferenced object orphans", async () => {
     const root = await mkdtemp(join(tmpdir(), "agentos-artifact-cleanup-"));
     try {

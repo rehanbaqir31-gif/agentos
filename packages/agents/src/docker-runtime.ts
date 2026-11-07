@@ -85,7 +85,12 @@ export class DockerIsolatedRuntime implements IsolatedRuntime {
     }
   }
 
-  async recover(runId: string, repositoryPath: string, workspacePath: string): Promise<void> {
+  async recover(
+    runId: string,
+    repositoryPath: string,
+    workspacePath: string,
+    leaseGeneration?: number,
+  ): Promise<void> {
     if (!z.string().uuid().safeParse(runId).success) throw new Error("Run ID must be a UUID");
     const listed = await this.docker.run([
       "ps",
@@ -93,6 +98,9 @@ export class DockerIsolatedRuntime implements IsolatedRuntime {
       "--quiet",
       "--filter=label=agentos.managed=true",
       `--filter=label=agentos.run-id=${runId}`,
+      ...(leaseGeneration === undefined
+        ? []
+        : [`--filter=label=agentos.lease-generation=${leaseGeneration}`]),
     ]);
     const containerIds = listed
       .split(/\s+/)
@@ -105,7 +113,11 @@ export class DockerIsolatedRuntime implements IsolatedRuntime {
     if (workspacePath) await this.workspaces.cleanupOrphan(repositoryPath, workspacePath);
   }
 
-  async allocate(config: AdapterConfig, runId: string): Promise<RuntimeAllocation> {
+  async allocate(
+    config: AdapterConfig,
+    runId: string,
+    leaseGeneration = 1,
+  ): Promise<RuntimeAllocation> {
     if (config.permissionMode !== "read_only") {
       throw new Error(
         "Docker runtime currently permits only read_only runs until AgentOS approvals are enforced",
@@ -128,6 +140,7 @@ export class DockerIsolatedRuntime implements IsolatedRuntime {
       `--name=${id}`,
       "--label=agentos.managed=true",
       `--label=agentos.run-id=${runId}`,
+      `--label=agentos.lease-generation=${leaseGeneration}`,
       "--network=none",
       "--read-only",
       "--user=10001:10001",

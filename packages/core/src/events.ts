@@ -21,6 +21,20 @@ export const agentEventSchema = z.discriminatedUnion("type", [
   z
     .object({
       ...base,
+      type: z.literal("run.recovered"),
+      data: z
+        .object({
+          workerId: z.string().min(1).max(256),
+          generation: z.number().int().positive(),
+          previousGeneration: z.number().int().positive().nullable(),
+          cleanupErrors: z.array(z.string().max(2_000)).max(16),
+        })
+        .strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...base,
       type: z.literal("run.completed"),
       data: z.object({ summary: z.string().max(20_000).nullable() }).strict(),
     })

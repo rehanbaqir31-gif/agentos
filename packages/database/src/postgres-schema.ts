@@ -22,6 +22,7 @@ import type {
   Provider,
   RunManifest,
   RunArtifact,
+  WorkerLease,
   Task,
 } from "@agentos/core";
 
@@ -173,6 +174,29 @@ export const pgExecutionRuns = pgTable(
     index("execution_runs_project_created_idx").on(table.projectId, table.createdAt),
     index("execution_runs_task_idx").on(table.taskId),
     uniqueIndex("execution_runs_id_project_id_uq").on(table.id, table.projectId),
+  ],
+);
+
+export const pgRunLeases = pgTable(
+  "run_leases",
+  {
+    runId: uuid("run_id")
+      .primaryKey()
+      .references(() => pgExecutionRuns.id, { onDelete: "restrict" }),
+    workerId: text("worker_id").notNull(),
+    generation: bigint("generation", { mode: "number" })
+      .$type<WorkerLease["generation"]>()
+      .notNull(),
+    claimedAt: utcTimestamp("claimed_at").notNull(),
+    heartbeatAt: utcTimestamp("heartbeat_at").notNull(),
+    expiresAt: utcTimestamp("expires_at").notNull(),
+    releasedAt: utcTimestamp("released_at"),
+  },
+  (table) => [
+    check("run_leases_generation_check", sql`${table.generation} > 0`),
+    check("run_leases_heartbeat_check", sql`${table.heartbeatAt} >= ${table.claimedAt}`),
+    check("run_leases_expiry_check", sql`${table.expiresAt} > ${table.claimedAt}`),
+    index("run_leases_expiration_idx").on(table.releasedAt, table.expiresAt, table.runId),
   ],
 );
 
@@ -353,5 +377,6 @@ export const pgExecutionRunsRelations = relations(pgExecutionRuns, ({ one, many 
   events: many(pgAgentEvents),
   approvals: many(pgApprovals),
   artifacts: many(pgRunArtifacts),
+  lease: one(pgRunLeases),
   evaluations: many(pgEvaluations),
 }));

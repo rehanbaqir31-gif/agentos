@@ -41,6 +41,7 @@ export type AdapterConfig = z.infer<typeof adapterConfigSchema>;
 export interface AgentSession {
   id: string;
   runId: string;
+  leaseGeneration?: number;
   createdAt: string;
   adapterVersion: string;
   baseCommit: string;
@@ -108,8 +109,17 @@ export interface AgentAdapter {
   health(config: AdapterConfig): Promise<{ healthy: boolean; version?: string }>;
   capabilities(): AgentCapabilities;
   validate(config: unknown): AdapterConfig;
-  initializeSession(config: AdapterConfig, runId: string): Promise<AgentSession>;
-  resumeSession(config: AdapterConfig, sessionId: string, runId: string): Promise<AgentSession>;
+  initializeSession(
+    config: AdapterConfig,
+    runId: string,
+    leaseGeneration?: number,
+  ): Promise<AgentSession>;
+  resumeSession(
+    config: AdapterConfig,
+    sessionId: string,
+    runId: string,
+    leaseGeneration?: number,
+  ): Promise<AgentSession>;
   closeSession(config: AdapterConfig, session: AgentSession): Promise<void>;
   execute(
     config: AdapterConfig,
@@ -130,6 +140,7 @@ export interface AgentAdapter {
     config: AdapterConfig,
     runId: string,
     workspacePath: string,
+    previousGeneration?: number,
   ): Promise<void>;
   respondPermission(
     config: AdapterConfig,
@@ -142,9 +153,18 @@ export interface AgentAdapter {
 
 export interface IsolatedRuntime {
   /** Must create a run-scoped OS sandbox; this is never optional during execution. */
-  allocate(config: AdapterConfig, runId: string): Promise<RuntimeAllocation>;
+  allocate(
+    config: AdapterConfig,
+    runId: string,
+    leaseGeneration?: number,
+  ): Promise<RuntimeAllocation>;
   detect?(): Promise<{ installed: boolean; version: string | null }>;
-  recover?(runId: string, repositoryPath: string, workspacePath: string): Promise<void>;
+  recover?(
+    runId: string,
+    repositoryPath: string,
+    workspacePath: string,
+    leaseGeneration?: number,
+  ): Promise<void>;
 }
 export interface RuntimeAllocation {
   workspacePath: string;

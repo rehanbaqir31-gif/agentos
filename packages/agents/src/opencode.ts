@@ -201,10 +201,14 @@ export class OpenCodeAdapter implements AgentAdapter {
       return { healthy: false };
     }
   }
-  private async connect(config: AdapterConfig, runId: string): Promise<OpencodeClient> {
+  private async connect(
+    config: AdapterConfig,
+    runId: string,
+    leaseGeneration = 1,
+  ): Promise<OpencodeClient> {
     const existing = this.clients.get(runId);
     if (existing) return existing;
-    const isolated = await this.runtime?.allocate(config, runId);
+    const isolated = await this.runtime?.allocate(config, runId, leaseGeneration);
     if (!isolated)
       throw new Error("OpenCode execution unavailable: no verified isolated runtime configured");
     try {
@@ -230,8 +234,12 @@ export class OpenCodeAdapter implements AgentAdapter {
       throw error;
     }
   }
-  async initializeSession(config: AdapterConfig, runId: string): Promise<AgentSession> {
-    const c = await this.connect(config, runId);
+  async initializeSession(
+    config: AdapterConfig,
+    runId: string,
+    leaseGeneration = 1,
+  ): Promise<AgentSession> {
+    const c = await this.connect(config, runId, leaseGeneration);
     try {
       const created = await c.session.create({
         body: { title: `AgentOS run ${runId}` },
@@ -245,6 +253,7 @@ export class OpenCodeAdapter implements AgentAdapter {
       return {
         id,
         runId,
+        leaseGeneration,
         createdAt: new Date().toISOString(),
         adapterVersion: allocation.adapterVersion,
         baseCommit: allocation.baseCommit,
@@ -373,10 +382,11 @@ export class OpenCodeAdapter implements AgentAdapter {
     config: AdapterConfig,
     runId: string,
     workspacePath: string,
+    previousGeneration?: number,
   ): Promise<void> {
     if (!this.runtime?.recover)
       throw new Error("Configured isolated runtime cannot reconcile interrupted runs");
-    await this.runtime.recover(runId, config.projectDirectory, workspacePath);
+    await this.runtime.recover(runId, config.projectDirectory, workspacePath, previousGeneration);
   }
   async closeSession(_config: AdapterConfig, session: AgentSession): Promise<void> {
     this.sessions.delete(session.runId);

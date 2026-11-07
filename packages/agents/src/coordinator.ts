@@ -9,6 +9,7 @@ import {
   type Project,
   type Task,
   type RepositorySet,
+  type RunLeaseIdentity,
 } from "@agentos/core";
 import { RepositoryConflictError } from "@agentos/database";
 import { AdapterRegistry } from "./registry.js";
@@ -39,6 +40,7 @@ export interface ExecutionOutcome {
 }
 
 export class ExecutionCoordinator {
+  private readonly workerId = `agentos-worker-${randomUUID()}`;
   constructor(
     private readonly repositories: RepositorySet,
     private readonly adapters: AdapterRegistry,
@@ -46,10 +48,7 @@ export class ExecutionCoordinator {
     private readonly now: () => string = () => new Date().toISOString(),
   ) {}
 
-  /**
-   * Call once during single-worker startup, before accepting new tasks. Active runs are failed
-   * rather than replayed because the adapter prompt may have performed non-idempotent work.
-   */
+  /** Claims only runs whose prior lease is absent, released or expired. Prompts are never replayed. */
   async recoverInterruptedRuns(): Promise<ExecutionRun[]> {
     const activeStatuses: ExecutionRun["status"][] = [
       "created",
@@ -68,6 +67,17 @@ export class ExecutionCoordinator {
         if (candidates.length === 0) break;
         for (const candidate of candidates) {
           attempted.add(candidate.id);
+          const claimed = await this.repositories.leases.claim(
+            candidate.id,
+            this.workerId,
+            this.now(),
+            new Date(Date.now() + 300_000).toISOString(),
+          );
+          if (!claimed) continue;
+          const identity: RunLeaseIdentity = {
+            workerId: claimed.lease.workerId,
+            generation: claimed.lease.generation,
+          };
           try {
             let recoveryError: string | null = null;
             if (candidate.workspaceId) {
@@ -82,7 +92,12 @@ export class ExecutionCoordinator {
                 });
                 if (!adapter.recoverInterruptedRun)
                   throw new Error("Adapter has no interrupted-run cleanup implementation");
-                await adapter.recoverInterruptedRun(config, candidate.id, candidate.workspaceId);
+                await adapter.recoverInterruptedRun(
+                  config,
+                  candidate.id,
+                  candidate.workspaceId,
+                  claimed.previousGeneration ?? undefined,
+                );
               } catch (error) {
                 recoveryError = safeMessage(error);
               }
@@ -90,20 +105,44 @@ export class ExecutionCoordinator {
             const message = recoveryError
               ? `Execution interrupted by process restart; automatic replay is disabled. Runtime cleanup failed: ${recoveryError}`
               : "Execution interrupted by process restart; automatic replay is disabled";
-            const run = await this.repositories.runs.update(candidate.id, {
-              status: "failed",
-              completedAt: candidate.startedAt ? this.now() : null,
-              error: message,
-            });
-            await this.append({
-              runId: run.id,
-              type: "run.failed",
-              occurredAt: this.now(),
-              data: {
-                code: "PROCESS_INTERRUPTED",
-                message: run.error!,
+            const run = await this.repositories.runs.updateOwned(
+              candidate.id,
+              {
+                status: "failed",
+                completedAt: candidate.startedAt ? this.now() : null,
+                error: message,
               },
-            });
+              identity,
+              this.now(),
+            );
+            await this.append(
+              {
+                runId: run.id,
+                type: "run.recovered",
+                occurredAt: this.now(),
+                data: {
+                  workerId: identity.workerId,
+                  generation: identity.generation,
+                  previousGeneration: claimed.previousGeneration,
+                  cleanupErrors: recoveryError ? [recoveryError] : [],
+                },
+              },
+              undefined,
+              identity,
+            );
+            await this.append(
+              {
+                runId: run.id,
+                type: "run.failed",
+                occurredAt: this.now(),
+                data: {
+                  code: "PROCESS_INTERRUPTED",
+                  message: run.error!,
+                },
+              },
+              undefined,
+              identity,
+            );
             recovered.push(run);
           } catch (error) {
             if (!(error instanceof RepositoryConflictError)) {
@@ -111,6 +150,10 @@ export class ExecutionCoordinator {
               if (!isTerminal(current.status)) throw error;
             }
             // Another recovery/worker changed this run after our snapshot; keep the winning state.
+          } finally {
+            await Promise.resolve(
+              this.repositories.leases.release(candidate.id, identity, this.now()),
+            ).catch(() => false);
           }
         }
       }
@@ -140,7 +183,7 @@ export class ExecutionCoordinator {
       permissionMode: project.settings.permissionMode,
     });
     const id = input.runId ?? randomUUID();
-    const run = await this.repositories.runs.create(
+    const { run, lease } = await this.repositories.runs.createWithLease(
       {
         taskId: task.id,
         projectId: project.id,
@@ -156,15 +199,23 @@ export class ExecutionCoordinator {
         error: null,
         usageMetrics: {},
       },
+      this.workerId,
+      this.now(),
+      new Date(Date.now() + 30_000).toISOString(),
       id,
     );
-    await this.append({
-      runId: run.id,
-      type: "run.created",
-      occurredAt: this.now(),
-      data: { taskId: task.id },
-    });
-    return this.executeCreated(run, task, project, agent, adapter, config, input.signal);
+    const identity: RunLeaseIdentity = { workerId: lease.workerId, generation: lease.generation };
+    await this.append(
+      {
+        runId: run.id,
+        type: "run.created",
+        occurredAt: this.now(),
+        data: { taskId: task.id },
+      },
+      undefined,
+      identity,
+    );
+    return this.executeCreated(run, task, project, agent, adapter, config, identity, input.signal);
   }
 
   private async executeCreated(
@@ -174,6 +225,7 @@ export class ExecutionCoordinator {
     agent: Agent,
     adapter: AgentAdapter,
     config: AdapterConfig,
+    identity: RunLeaseIdentity,
     signal?: AbortSignal,
   ): Promise<ExecutionOutcome> {
     let run = created;
@@ -185,11 +237,27 @@ export class ExecutionCoordinator {
     let manifest: RunManifest | undefined;
     let artifactsCaptured = false;
     const controller = new AbortController();
+    const heartbeat = setInterval(() => {
+      void Promise.resolve(
+        this.repositories.leases.renew(
+          run.id,
+          identity,
+          this.now(),
+          new Date(Date.now() + 30_000).toISOString(),
+        ),
+      )
+        .then((lease) => {
+          if (!lease) controller.abort(new Error("Worker lease lost; run ownership fenced"));
+        })
+        .catch(() =>
+          controller.abort(new Error("Worker lease renewal failed; run ownership fenced")),
+        );
+    }, 10_000);
     const abort = () => controller.abort(signal?.reason);
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
     try {
-      run = await this.transition(run, "validating");
+      run = await this.transition(run, "validating", identity);
       if (project.settings.permissionMode !== "read_only")
         throw new Error(
           "Supervised/autonomous execution is unavailable until AgentOS approval enforcement exists",
@@ -197,25 +265,43 @@ export class ExecutionCoordinator {
       const detected = await adapter.detect(config);
       if (!detected.installed || !detected.version)
         throw new Error(detected.reason ?? "OpenCode installation or runtime image is unavailable");
-      run = await this.repositories.runs.update(run.id, { adapterVersion: detected.version });
+      run = await this.repositories.runs.updateOwned(
+        run.id,
+        { adapterVersion: detected.version },
+        identity,
+        this.now(),
+      );
 
-      run = await this.transition(run, "preparing_workspace");
-      run = await this.transition(run, "queued");
-      session = await adapter.initializeSession(config, run.id);
-      run = await this.repositories.runs.update(run.id, {
-        adapterVersion: session.adapterVersion,
-        workspaceId: session.workspacePath,
-      });
-      manifest = await this.persistManifest(run, task, project, agent, config, session);
-      await this.append({
-        runId: run.id,
-        type: "session.attached",
-        occurredAt: this.now(),
-        data: { sessionId: session.id },
-      });
+      run = await this.transition(run, "preparing_workspace", identity);
+      run = await this.transition(run, "queued", identity);
+      session = await adapter.initializeSession(config, run.id, identity.generation);
+      run = await this.repositories.runs.updateOwned(
+        run.id,
+        {
+          adapterVersion: session.adapterVersion,
+          workspaceId: session.workspacePath,
+        },
+        identity,
+        this.now(),
+      );
+      manifest = await this.persistManifest(run, task, project, agent, config, session, identity);
+      await this.append(
+        {
+          runId: run.id,
+          type: "session.attached",
+          occurredAt: this.now(),
+          data: { sessionId: session.id },
+        },
+        undefined,
+        identity,
+      );
 
-      run = await this.transition(run, "running", { startedAt: this.now() });
-      await this.append({ runId: run.id, type: "run.started", occurredAt: this.now(), data: {} });
+      run = await this.transition(run, "running", identity, { startedAt: this.now() });
+      await this.append(
+        { runId: run.id, type: "run.started", occurredAt: this.now(), data: {} },
+        undefined,
+        identity,
+      );
       streamAbort = new AbortController();
       let streamError: unknown;
       let markStreamReady!: () => void;
@@ -227,6 +313,7 @@ export class ExecutionCoordinator {
         config,
         session,
         run.id,
+        identity,
         streamAbort.signal,
         markStreamReady,
       ).catch((error: unknown) => {
@@ -255,32 +342,44 @@ export class ExecutionCoordinator {
             : executionResult.status,
       );
       result = finalResult;
-      const captured = await this.artifacts.capture(run.id, project.id, manifest, finalResult);
+      const captured = await this.artifacts.capture(
+        run.id,
+        project.id,
+        manifest,
+        finalResult,
+        identity,
+      );
       artifactsCaptured = true;
       const diffSha256 =
         finalResult.diff === null
           ? null
           : createHash("sha256").update(finalResult.diff).digest("hex");
-      await this.append({
-        runId: run.id,
-        type: "run.result",
-        occurredAt: this.now(),
-        data: {
-          summary: finalResult.summary,
-          diffSha256,
-          files: finalResult.changedFiles.map((path) => ({
-            path,
-            sha256: finalResult.fileHashes[path] ?? null,
-          })),
-          artifacts: captured.artifacts.map(({ id, type, collectionStatus, byteSize, sha256 }) => ({
-            id,
-            type,
-            collectionStatus,
-            byteSize,
-            sha256,
-          })),
+      await this.append(
+        {
+          runId: run.id,
+          type: "run.result",
+          occurredAt: this.now(),
+          data: {
+            summary: finalResult.summary,
+            diffSha256,
+            files: finalResult.changedFiles.map((path) => ({
+              path,
+              sha256: finalResult.fileHashes[path] ?? null,
+            })),
+            artifacts: captured.artifacts.map(
+              ({ id, type, collectionStatus, byteSize, sha256 }) => ({
+                id,
+                type,
+                collectionStatus,
+                byteSize,
+                sha256,
+              }),
+            ),
+          },
         },
-      });
+        undefined,
+        identity,
+      );
       if (captured.failures.length)
         throw new Error(
           `Required result artifact persistence failed: ${captured.failures.join("; ")}`,
@@ -293,13 +392,17 @@ export class ExecutionCoordinator {
         );
       await adapter.closeSession(config, session);
       sessionClosed = true;
-      run = await this.transition(run, "succeeded", { completedAt: this.now() });
-      await this.append({
-        runId: run.id,
-        type: "run.completed",
-        occurredAt: this.now(),
-        data: { summary: finalResult.summary },
-      });
+      run = await this.transition(run, "succeeded", identity, { completedAt: this.now() });
+      await this.append(
+        {
+          runId: run.id,
+          type: "run.completed",
+          occurredAt: this.now(),
+          data: { summary: finalResult.summary },
+        },
+        undefined,
+        identity,
+      );
       return { run, result, error: null };
     } catch (error) {
       streamAbort?.abort();
@@ -318,33 +421,38 @@ export class ExecutionCoordinator {
               project.id,
               manifest,
               partialResult,
+              identity,
             );
             artifactsCaptured = true;
-            await this.append({
-              runId: run.id,
-              type: "run.result",
-              occurredAt: this.now(),
-              data: {
-                summary: result.summary,
-                diffSha256:
-                  partialResult.diff === null
-                    ? null
-                    : createHash("sha256").update(partialResult.diff).digest("hex"),
-                files: partialResult.changedFiles.map((path) => ({
-                  path,
-                  sha256: partialResult.fileHashes[path] ?? null,
-                })),
-                artifacts: captured.artifacts.map(
-                  ({ id, type, collectionStatus, byteSize, sha256 }) => ({
-                    id,
-                    type,
-                    collectionStatus,
-                    byteSize,
-                    sha256,
-                  }),
-                ),
+            await this.append(
+              {
+                runId: run.id,
+                type: "run.result",
+                occurredAt: this.now(),
+                data: {
+                  summary: result.summary,
+                  diffSha256:
+                    partialResult.diff === null
+                      ? null
+                      : createHash("sha256").update(partialResult.diff).digest("hex"),
+                  files: partialResult.changedFiles.map((path) => ({
+                    path,
+                    sha256: partialResult.fileHashes[path] ?? null,
+                  })),
+                  artifacts: captured.artifacts.map(
+                    ({ id, type, collectionStatus, byteSize, sha256 }) => ({
+                      id,
+                      type,
+                      collectionStatus,
+                      byteSize,
+                      sha256,
+                    }),
+                  ),
+                },
               },
-            });
+              undefined,
+              identity,
+            );
           } catch {
             // Preserve the original run failure; incomplete capture remains visible through absent artifacts.
           }
@@ -357,28 +465,45 @@ export class ExecutionCoordinator {
       if (!isTerminal(current.status)) {
         const status =
           controller.signal.aborted || result?.status === "cancelled" ? "cancelled" : "failed";
-        run = await this.repositories.runs.update(run.id, {
-          status,
-          completedAt: current.startedAt ? this.now() : null,
-          error: message,
-        });
+        run = await this.repositories.runs.updateOwned(
+          run.id,
+          {
+            status,
+            completedAt: current.startedAt ? this.now() : null,
+            error: message,
+          },
+          identity,
+          this.now(),
+        );
         if (status === "cancelled")
-          await this.append({
-            runId: run.id,
-            type: "run.cancelled",
-            occurredAt: this.now(),
-            data: { reason: message },
-          });
+          await this.append(
+            {
+              runId: run.id,
+              type: "run.cancelled",
+              occurredAt: this.now(),
+              data: { reason: message },
+            },
+            undefined,
+            identity,
+          );
         else
-          await this.append({
-            runId: run.id,
-            type: "run.failed",
-            occurredAt: this.now(),
-            data: { code: "EXECUTION_FAILED", message },
-          });
+          await this.append(
+            {
+              runId: run.id,
+              type: "run.failed",
+              occurredAt: this.now(),
+              data: { code: "EXECUTION_FAILED", message },
+            },
+            undefined,
+            identity,
+          );
       }
       return { run, result, error: message };
     } finally {
+      clearInterval(heartbeat);
+      await Promise.resolve(this.repositories.leases.release(run.id, identity, this.now())).catch(
+        () => false,
+      );
       signal?.removeEventListener("abort", abort);
     }
   }
@@ -390,6 +515,7 @@ export class ExecutionCoordinator {
     agent: Agent,
     config: AdapterConfig,
     session: AgentSession,
+    identity: RunLeaseIdentity,
   ): Promise<RunManifest> {
     const promptConfigurationHash = createHash("sha256")
       .update(
@@ -404,46 +530,63 @@ export class ExecutionCoordinator {
         }),
       )
       .digest("hex");
-    return await this.repositories.manifests.create({
-      version: 1,
-      runId: run.id,
-      agentId: agent.id,
-      agentName: agent.name,
-      adapterId: agent.adapterId,
-      adapterVersion: session.adapterVersion,
-      providerId: run.providerId,
-      modelId: run.modelId,
-      promptConfigurationHash,
-      repositoryCommitSha: session.baseCommit,
-      toolVersions: { opencode: session.adapterVersion },
-      skillVersions: {},
-      runtimeConfiguration: session.runtimeConfiguration,
-      permissionConfiguration: project.settings,
-      environmentVariableNames: Object.keys(config.environment),
-    });
+    return await this.repositories.manifests.createOwned(
+      {
+        version: 1,
+        runId: run.id,
+        agentId: agent.id,
+        agentName: agent.name,
+        adapterId: agent.adapterId,
+        adapterVersion: session.adapterVersion,
+        providerId: run.providerId,
+        modelId: run.modelId,
+        promptConfigurationHash,
+        repositoryCommitSha: session.baseCommit,
+        toolVersions: { opencode: session.adapterVersion },
+        skillVersions: {},
+        runtimeConfiguration: session.runtimeConfiguration,
+        permissionConfiguration: project.settings,
+        environmentVariableNames: Object.keys(config.environment),
+      },
+      identity,
+      this.now(),
+    );
   }
 
   private async transition(
     current: ExecutionRun,
     status: ExecutionRun["status"],
+    identity: RunLeaseIdentity,
     extra: Partial<Pick<ExecutionRun, "startedAt" | "completedAt">> = {},
   ): Promise<ExecutionRun> {
-    const run = await this.repositories.runs.update(current.id, { status, ...extra });
-    await this.append({
-      runId: run.id,
-      type: "agent.status",
-      occurredAt: this.now(),
-      data: { status, message: null },
-    });
+    const run = await this.repositories.runs.updateOwned(
+      current.id,
+      { status, ...extra },
+      identity,
+      this.now(),
+    );
+    await this.append(
+      {
+        runId: run.id,
+        type: "agent.status",
+        occurredAt: this.now(),
+        data: { status, message: null },
+      },
+      undefined,
+      identity,
+    );
     return run;
   }
 
   private async append(
     input: CreateAgentEvent,
     deterministicId?: string,
+    identity?: RunLeaseIdentity,
   ): Promise<AgentEvent | null> {
     try {
-      return await this.repositories.events.append(input, deterministicId);
+      return identity
+        ? await this.repositories.events.appendOwned(input, identity, this.now(), deterministicId)
+        : await this.repositories.events.append(input, deterministicId);
     } catch (error) {
       if (deterministicId && error instanceof RepositoryConflictError) return null;
       throw error;
@@ -455,6 +598,7 @@ export class ExecutionCoordinator {
     config: AdapterConfig,
     session: AgentSession,
     runId: ExecutionRunId,
+    identity: RunLeaseIdentity,
     signal: AbortSignal,
     onReady: () => void,
   ): Promise<void> {
@@ -471,6 +615,7 @@ export class ExecutionCoordinator {
             data: { toolName: event.tool, callId: event.callId },
           },
           id,
+          identity,
         );
       else if (event.type === "tool.completed" && event.callId)
         await this.append(
@@ -481,6 +626,7 @@ export class ExecutionCoordinator {
             data: { toolName: event.tool, callId: event.callId, exitCode: null },
           },
           id,
+          identity,
         );
       else if (event.type === "tool.failed" && event.callId)
         await this.append(
@@ -491,14 +637,16 @@ export class ExecutionCoordinator {
             data: { toolName: event.tool, callId: event.callId, error: event.error },
           },
           id,
+          identity,
         );
       else if (event.type === "file.changed")
         await this.append(
           { runId, type: "file.changed", occurredAt: event.at, data: { path: event.path } },
           id,
+          identity,
         );
       else if (event.type === "permission.requested")
-        await this.rejectPermission(adapter, config, session, runId, event);
+        await this.rejectPermission(adapter, config, session, runId, identity, event);
     }
   }
 
@@ -507,6 +655,7 @@ export class ExecutionCoordinator {
     config: AdapterConfig,
     session: AgentSession,
     runId: ExecutionRunId,
+    identity: RunLeaseIdentity,
     event: Extract<NormalizedAgentEvent, { type: "permission.requested" }>,
   ): Promise<void> {
     const requestedAt = event.at;
@@ -520,7 +669,7 @@ export class ExecutionCoordinator {
       : undefined;
     let approval;
     try {
-      approval = await this.repositories.approvals.create(
+      approval = await this.repositories.approvals.createOwned(
         {
           runId,
           actionType: event.action.slice(0, 128),
@@ -531,6 +680,8 @@ export class ExecutionCoordinator {
           resolvedAt: null,
           resolvedBy: null,
         },
+        identity,
+        this.now(),
         approvalId,
       );
     } catch (error) {
@@ -538,10 +689,12 @@ export class ExecutionCoordinator {
       approval = await this.repositories.approvals.getById(approvalId);
     }
     if (approval.status === "pending")
-      approval = await this.repositories.approvals.resolve(
+      approval = await this.repositories.approvals.resolveOwned(
         approval.id,
         "rejected",
         "agentos-policy:read_only",
+        identity,
+        this.now(),
       );
     const eventKey = event.sourceEventId ? `permission:${event.sourceEventId}` : undefined;
     await this.append(
@@ -552,6 +705,7 @@ export class ExecutionCoordinator {
         data: { approvalId: approval.id, actionType: approval.actionType },
       },
       eventKey ? stableEventId(runId, `${eventKey}:requested`) : undefined,
+      identity,
     );
     await this.append(
       {
@@ -561,6 +715,7 @@ export class ExecutionCoordinator {
         data: { approvalId: approval.id, resolvedBy: approval.resolvedBy! },
       },
       eventKey ? stableEventId(runId, `${eventKey}:rejected`) : undefined,
+      identity,
     );
     await adapter.respondPermission(config, session, event.permissionId, false);
   }
