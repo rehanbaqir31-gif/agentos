@@ -13,7 +13,8 @@
     "build": "tsc -p tsconfig.json",
     "check-types": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint src test",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:docker": "node test/run-docker-integration.mjs"
   },
   "dependencies": {
     "@agentos/core": "workspace:*",

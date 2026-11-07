@@ -11,7 +11,8 @@ import type {
 } from "./contracts.js";
 import { GitWorkspaceManager, type GitCommandRunner } from "./git-workspace.js";
 
-const digestImage = z.string().regex(/^[a-z0-9./_-]+@sha256:[a-f0-9]{64}$/i);
+// Locally built test images are pinned by their immutable image ID (sha256:config-digest).
+const digestImage = z.string().regex(/^(?:[a-z0-9./_-]+@)?sha256:[a-f0-9]{64}$/i);
 export interface DockerCommandRunner {
   run(
     args: string[],
@@ -21,7 +22,26 @@ export interface DockerCommandRunner {
 const exec = promisify(execFile);
 export const systemDockerRunner: DockerCommandRunner = {
   async run(args, options = {}) {
-    const environment = { ...process.env, ...options.environment };
+    const environment = Object.fromEntries(
+      [
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "SystemRoot",
+        "SYSTEMROOT",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "DOCKER_HOST",
+        "DOCKER_CONTEXT",
+        "DOCKER_CONFIG",
+        "DOCKER_CERT_PATH",
+        "DOCKER_TLS_VERIFY",
+      ]
+        .filter((key) => process.env[key] !== undefined)
+        .map((key) => [key, process.env[key] as string]),
+    );
+    Object.assign(environment, options.environment);
     const result = await exec("docker", args, {
       env: environment,
       timeout: options.timeoutMs ?? 30_000,
@@ -110,6 +130,24 @@ export class DockerIsolatedRuntime implements IsolatedRuntime {
       throw new Error("Docker returned an invalid container identifier during recovery");
     for (const containerId of containerIds)
       await this.docker.run(["rm", "--force", containerId], { timeoutMs: 10_000 });
+    const networks = await this.docker.run([
+      "network",
+      "ls",
+      "--quiet",
+      "--filter=label=agentos.managed=true",
+      `--filter=label=agentos.run-id=${runId}`,
+      ...(leaseGeneration === undefined
+        ? []
+        : [`--filter=label=agentos.lease-generation=${leaseGeneration}`]),
+    ]);
+    const networkIds = networks
+      .split(/\s+/)
+      .map((id) => id.trim())
+      .filter(Boolean);
+    if (networkIds.some((id) => !/^[a-f0-9]{12,64}$/i.test(id)))
+      throw new Error("Docker returned an invalid network identifier during recovery");
+    for (const networkId of networkIds)
+      await this.docker.run(["network", "rm", networkId], { timeoutMs: 10_000 });
     if (workspacePath) await this.workspaces.cleanupOrphan(repositoryPath, workspacePath);
   }
 
@@ -126,6 +164,7 @@ export class DockerIsolatedRuntime implements IsolatedRuntime {
     if (!z.string().uuid().safeParse(runId).success) throw new Error("Run ID must be a UUID");
     const workspace = await this.workspaces.create(config.projectDirectory);
     const id = `agentos-${randomUUID()}`;
+    const network = `agentos-${runId}-${leaseGeneration}`;
     const password = randomBytes(32).toString("base64url");
     const authorizationHeader = `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`;
     const mountPath = workspace.path.replaceAll("\\", "/");
@@ -133,19 +172,23 @@ export class DockerIsolatedRuntime implements IsolatedRuntime {
       await workspace.cleanup();
       throw new Error("Docker bind mount paths cannot contain commas");
     }
+    const labels = [
+      "--label=agentos.managed=true",
+      `--label=agentos.run-id=${runId}`,
+      `--label=agentos.lease-generation=${leaseGeneration}`,
+    ];
     const args = [
       "run",
       "--detach",
       "--init",
       `--name=${id}`,
-      "--label=agentos.managed=true",
-      `--label=agentos.run-id=${runId}`,
-      `--label=agentos.lease-generation=${leaseGeneration}`,
-      "--network=none",
+      ...labels,
+      `--network=${network}`,
       "--read-only",
       "--user=10001:10001",
       "--cap-drop=ALL",
       "--security-opt=no-new-privileges:true",
+      "--stop-timeout=5",
       "--pids-limit=128",
       "--memory=2g",
       "--cpus=2",
@@ -164,6 +207,14 @@ export class DockerIsolatedRuntime implements IsolatedRuntime {
       "4096",
     ];
     try {
+      await this.docker.run([
+        "network",
+        "create",
+        "--driver=bridge",
+        "--internal",
+        ...labels,
+        network,
+      ]);
       await this.docker.run(args, {
         timeoutMs: 45_000,
         environment: { OPENCODE_SERVER_PASSWORD: password },
@@ -207,7 +258,11 @@ export class DockerIsolatedRuntime implements IsolatedRuntime {
         authorizationHeader,
         cancel: async () => {
           if (!disposed && !stopped) {
-            await this.docker.run(["kill", id], { timeoutMs: 10_000 });
+            try {
+              await this.docker.run(["stop", "--time=5", id], { timeoutMs: 7_000 });
+            } catch {
+              await this.docker.run(["kill", id], { timeoutMs: 5_000 });
+            }
             stopped = true;
           }
         },
@@ -226,6 +281,7 @@ export class DockerIsolatedRuntime implements IsolatedRuntime {
         dispose: async () => {
           if (disposed) return;
           await this.docker.run(["rm", "--force", id], { timeoutMs: 10_000 });
+          await this.docker.run(["network", "rm", network], { timeoutMs: 10_000 });
           stopped = true;
           await workspace.cleanup();
           disposed = true;
@@ -236,6 +292,11 @@ export class DockerIsolatedRuntime implements IsolatedRuntime {
         await this.docker.run(["rm", "--force", id], { timeoutMs: 10_000 });
       } catch (cleanupError) {
         if (isMissingContainer(cleanupError)) {
+          await this.docker
+            .run(["network", "rm", network], { timeoutMs: 10_000 })
+            .catch((error) => {
+              if (!isMissingContainer(error)) throw error;
+            });
           await workspace.cleanup();
           throw error;
         }
@@ -244,6 +305,11 @@ export class DockerIsolatedRuntime implements IsolatedRuntime {
           `Docker setup failed; workspace retained at ${workspace.path} because container termination could not be verified`,
         );
       }
+      await this.docker
+        .run(["network", "rm", network], { timeoutMs: 10_000 })
+        .catch((cleanupError) => {
+          if (!isMissingContainer(cleanupError)) throw cleanupError;
+        });
       await workspace.cleanup();
       throw error;
     }

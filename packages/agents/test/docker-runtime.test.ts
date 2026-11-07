@@ -48,8 +48,11 @@ describe("Docker isolated runtime", () => {
         permissionMode: "read_only",
       });
       const allocation = await runtime.allocate(config, "018f86a6-19fd-7ac2-bd82-fd9637e1fb72");
-      const args = calls[0]?.args ?? [];
-      expect(args).toContain("--network=none");
+      const args = calls.find(({ args: called }) => called[0] === "run")?.args ?? [];
+      expect(args).toContain("--network=agentos-018f86a6-19fd-7ac2-bd82-fd9637e1fb72-1");
+      expect(
+        calls.some(({ args: called }) => called[0] === "network" && called.includes("--internal")),
+      ).toBe(true);
       expect(args).toContain("--read-only");
       expect(args).toContain("--user=10001:10001");
       expect(args).toContain("--cap-drop=ALL");
@@ -60,12 +63,13 @@ describe("Docker isolated runtime", () => {
       expect(args.filter((arg) => arg.startsWith("--mount="))).toHaveLength(1);
       expect(args.some((arg) => /docker\.sock|docker_engine/i.test(arg))).toBe(false);
       expect(args[args.indexOf(image)]).toBe(image);
-      expect(calls[0]?.environment && Object.keys(calls[0].environment)).toEqual([
+      const runCall = calls.find(({ args: called }) => called[0] === "run");
+      expect(runCall?.environment && Object.keys(runCall.environment)).toEqual([
         "OPENCODE_SERVER_PASSWORD",
       ]);
       expect(allocation.serverUrl).toBe("http://127.0.0.1:49152");
       expect(allocation.authorizationHeader).toMatch(/^Basic /);
-      const password = calls[0]?.environment?.["OPENCODE_SERVER_PASSWORD"];
+      const password = runCall?.environment?.["OPENCODE_SERVER_PASSWORD"];
       expect(password).toBeTruthy();
       expect(
         Buffer.from(allocation.authorizationHeader.slice("Basic ".length), "base64").toString(),
@@ -73,7 +77,9 @@ describe("Docker isolated runtime", () => {
       expect(args.join(" ")).not.toContain(password);
       await allocation.cancel();
       await allocation.dispose();
-      expect(calls.some(({ args: called }) => called[0] === "kill")).toBe(true);
+      expect(
+        calls.some(({ args: called }) => called[0] === "stop" && called.includes("--time=5")),
+      ).toBe(true);
       expect(
         calls.some(({ args: called }) => called[0] === "rm" && called.includes("--force")),
       ).toBe(true);
@@ -165,10 +171,38 @@ describe("Docker isolated runtime", () => {
         `--filter=label=agentos.run-id=${runId}`,
       ]);
       expect(calls[1]).toEqual(["rm", "--force", "abcdef012345"]);
+      expect(calls[2]).toEqual([
+        "network",
+        "ls",
+        "--quiet",
+        "--filter=label=agentos.managed=true",
+        `--filter=label=agentos.run-id=${runId}`,
+      ]);
       await expect(access(workspace.path)).rejects.toThrow();
     } finally {
       await rm(f.parent, { recursive: true, force: true });
     }
+  });
+
+  it("filters recovery cleanup to the exact lease generation for containers and networks", async () => {
+    const calls: string[][] = [];
+    const runtime = new DockerIsolatedRuntime({
+      image,
+      commandRunner: {
+        async run(args) {
+          calls.push(args);
+          if (args[0] === "ps") return "abcdef012345";
+          if (args[0] === "network" && args[1] === "ls") return "fedcba654321";
+          return "";
+        },
+      },
+    });
+    const runId = "018f86a6-19fd-7ac2-bd82-fd9637e1fb72";
+    await runtime.recover(runId, "C:\\repo", "", 7);
+    expect(calls[0]).toContain(`--filter=label=agentos.lease-generation=7`);
+    expect(calls[2]).toContain(`--filter=label=agentos.lease-generation=7`);
+    expect(calls[1]).toEqual(["rm", "--force", "abcdef012345"]);
+    expect(calls[3]).toEqual(["network", "rm", "fedcba654321"]);
   });
 
   it("refuses Docker identifiers that cannot be safely targeted during recovery", async () => {
