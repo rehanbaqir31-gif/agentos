@@ -369,6 +369,15 @@ export class OpenCodeAdapter implements AgentAdapter {
     if (!runtime) throw new Error("No isolated runtime is attached to this run");
     return runtime.collectResults();
   }
+  async recoverInterruptedRun(
+    config: AdapterConfig,
+    runId: string,
+    workspacePath: string,
+  ): Promise<void> {
+    if (!this.runtime?.recover)
+      throw new Error("Configured isolated runtime cannot reconcile interrupted runs");
+    await this.runtime.recover(runId, config.projectDirectory, workspacePath);
+  }
   async closeSession(_config: AdapterConfig, session: AgentSession): Promise<void> {
     this.sessions.delete(session.runId);
     this.clients.delete(session.runId);

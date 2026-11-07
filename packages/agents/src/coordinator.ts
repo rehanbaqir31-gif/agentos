@@ -66,10 +66,31 @@ export class ExecutionCoordinator {
         for (const candidate of candidates) {
           attempted.add(candidate.id);
           try {
+            let recoveryError: string | null = null;
+            if (candidate.workspaceId) {
+              try {
+                const project = await this.repositories.projects.getById(candidate.projectId);
+                const agent = await this.repositories.agents.getById(candidate.agentId);
+                const adapter = this.adapters.get(agent.adapterId);
+                const config = adapter.validate({
+                  ...agent.configuration,
+                  projectDirectory: project.repositoryPath,
+                  permissionMode: project.settings.permissionMode,
+                });
+                if (!adapter.recoverInterruptedRun)
+                  throw new Error("Adapter has no interrupted-run cleanup implementation");
+                await adapter.recoverInterruptedRun(config, candidate.id, candidate.workspaceId);
+              } catch (error) {
+                recoveryError = safeMessage(error);
+              }
+            }
+            const message = recoveryError
+              ? `Execution interrupted by process restart; automatic replay is disabled. Runtime cleanup failed: ${recoveryError}`
+              : "Execution interrupted by process restart; automatic replay is disabled";
             const run = await this.repositories.runs.update(candidate.id, {
               status: "failed",
               completedAt: candidate.startedAt ? this.now() : null,
-              error: "Execution interrupted by process restart; automatic replay is disabled",
+              error: message,
             });
             await this.append({
               runId: run.id,

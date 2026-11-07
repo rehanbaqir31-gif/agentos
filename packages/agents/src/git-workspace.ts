@@ -119,6 +119,38 @@ export class GitExecutionWorkspace {
 
 export class GitWorkspaceManager {
   constructor(private readonly git: GitCommandRunner = systemGitRunner) {}
+
+  async cleanupOrphan(repositoryPath: string, workspacePath: string): Promise<void> {
+    const repositoryRoot = await realpath(repositoryPath);
+    const rootFromGit = (
+      await this.git.run(repositoryRoot, ["rev-parse", "--show-toplevel"])
+    ).trim();
+    if ((await realpath(rootFromGit)) !== repositoryRoot)
+      throw new Error("Project path must be the Git repository root");
+
+    const workspace = resolve(workspacePath);
+    const parent = resolve(workspace, "..");
+    const temporaryRoot = await realpath(tmpdir());
+    const realParent = await realpath(parent);
+    const realWorkspace = await realpath(workspace);
+    const parentRelative = relative(temporaryRoot, realParent);
+    const workspaceRelative = relative(realParent, realWorkspace);
+    const safeUuid = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+    if (
+      parentRelative === ".." ||
+      parentRelative.startsWith(`..${sep}`) ||
+      isAbsolute(parentRelative) ||
+      !new RegExp(`^agentos-${safeUuid}-[A-Za-z0-9]+$`, "i").test(basename(realParent)) ||
+      workspaceRelative !== basename(realWorkspace) ||
+      !new RegExp(`^run-${safeUuid}-[A-Za-z0-9]+$`, "i").test(basename(realWorkspace))
+    ) {
+      throw new Error("Refusing unsafe orphan worktree cleanup");
+    }
+
+    await this.git.run(repositoryRoot, ["worktree", "remove", "--force", realWorkspace]);
+    await rm(realParent, { recursive: true, force: false });
+  }
+
   async create(
     repositoryPath: string,
     requestedBaseCommit?: string,

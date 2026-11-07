@@ -85,6 +85,26 @@ export class DockerIsolatedRuntime implements IsolatedRuntime {
     }
   }
 
+  async recover(runId: string, repositoryPath: string, workspacePath: string): Promise<void> {
+    if (!z.string().uuid().safeParse(runId).success) throw new Error("Run ID must be a UUID");
+    const listed = await this.docker.run([
+      "ps",
+      "--all",
+      "--quiet",
+      "--filter=label=agentos.managed=true",
+      `--filter=label=agentos.run-id=${runId}`,
+    ]);
+    const containerIds = listed
+      .split(/\s+/)
+      .map((id) => id.trim())
+      .filter(Boolean);
+    if (containerIds.some((id) => !/^[a-f0-9]{12,64}$/i.test(id)))
+      throw new Error("Docker returned an invalid container identifier during recovery");
+    for (const containerId of containerIds)
+      await this.docker.run(["rm", "--force", containerId], { timeoutMs: 10_000 });
+    if (workspacePath) await this.workspaces.cleanupOrphan(repositoryPath, workspacePath);
+  }
+
   async allocate(config: AdapterConfig, runId: string): Promise<RuntimeAllocation> {
     if (config.permissionMode !== "read_only") {
       throw new Error(

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { adapterConfigSchema } from "../src/contracts.js";
 import { DockerIsolatedRuntime, type DockerCommandRunner } from "../src/docker-runtime.js";
+import { GitWorkspaceManager } from "../src/git-workspace.js";
 
 const execFile = promisify(nodeExecFile);
 const image = `ghcr.io/example/opencode@sha256:${"a".repeat(64)}`;
@@ -138,5 +139,52 @@ describe("Docker isolated runtime", () => {
     } finally {
       await rm(f.parent, { recursive: true, force: true });
     }
+  });
+
+  it("removes only a run-labeled orphan container and its owned temporary worktree", async () => {
+    const f = await gitRepo();
+    const workspace = await new GitWorkspaceManager().create(f.repository);
+    const calls: string[][] = [];
+    const runtime = new DockerIsolatedRuntime({
+      image,
+      commandRunner: {
+        async run(args) {
+          calls.push(args);
+          return args[0] === "ps" ? "abcdef012345" : "";
+        },
+      },
+    });
+    const runId = "018f86a6-19fd-7ac2-bd82-fd9637e1fb72";
+    try {
+      await runtime.recover(runId, f.repository, workspace.path);
+      expect(calls[0]).toEqual([
+        "ps",
+        "--all",
+        "--quiet",
+        "--filter=label=agentos.managed=true",
+        `--filter=label=agentos.run-id=${runId}`,
+      ]);
+      expect(calls[1]).toEqual(["rm", "--force", "abcdef012345"]);
+      await expect(access(workspace.path)).rejects.toThrow();
+    } finally {
+      await rm(f.parent, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses Docker identifiers that cannot be safely targeted during recovery", async () => {
+    const calls: string[][] = [];
+    const runtime = new DockerIsolatedRuntime({
+      image,
+      commandRunner: {
+        async run(args) {
+          calls.push(args);
+          return args[0] === "ps" ? "not-a-container" : "";
+        },
+      },
+    });
+    await expect(
+      runtime.recover("018f86a6-19fd-7ac2-bd82-fd9637e1fb72", "C:\\repo", ""),
+    ).rejects.toThrow(/invalid container identifier/);
+    expect(calls).toHaveLength(1);
   });
 });

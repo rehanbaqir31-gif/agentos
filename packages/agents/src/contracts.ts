@@ -118,6 +118,11 @@ export interface AgentAdapter {
   cancel(config: AdapterConfig, session: AgentSession): Promise<void>;
   status(config: AdapterConfig, session: AgentSession): Promise<unknown>;
   collectResults(config: AdapterConfig, session: AgentSession): Promise<AgentResult>;
+  recoverInterruptedRun?(
+    config: AdapterConfig,
+    runId: string,
+    workspacePath: string,
+  ): Promise<void>;
   respondPermission(
     config: AdapterConfig,
     session: AgentSession,
@@ -131,6 +136,7 @@ export interface IsolatedRuntime {
   /** Must create a run-scoped OS sandbox; this is never optional during execution. */
   allocate(config: AdapterConfig, runId: string): Promise<RuntimeAllocation>;
   detect?(): Promise<{ installed: boolean; version: string | null }>;
+  recover?(runId: string, repositoryPath: string, workspacePath: string): Promise<void>;
 }
 export interface RuntimeAllocation {
   workspacePath: string;
