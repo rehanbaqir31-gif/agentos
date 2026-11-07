@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AgentOsDatabase } from "../src/database.js";
-import { applyMigrations, openDatabase } from "../src/database.js";
+import { applyMigrations, openDatabase, rollbackLastMigration } from "../src/database.js";
 import {
   Repositories,
   RelationshipValidationError,
@@ -93,17 +93,49 @@ describe("SQLite database and repositories", () => {
   it("initializes versioned schema and applies migrations only once", () => {
     expect(database.sqlite.pragma("foreign_keys", { simple: true })).toBe(1);
     expect(database.sqlite.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({
-      n: 1,
+      n: 5,
     });
     applyMigrations(database.sqlite, migrations);
     expect(database.sqlite.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({
-      n: 1,
+      n: 5,
     });
     expect(() =>
       applyMigrations(database.sqlite, [
         { ...migrations[0]!, sql: `${migrations[0]!.sql}\n-- changed` },
       ]),
     ).toThrow("has changed");
+  });
+
+  it("rolls back the additive approval migration only when no approval audit fields are populated", async () => {
+    expect(rollbackLastMigration(database.sqlite)).toBe(5);
+    expect(rollbackLastMigration(database.sqlite)).toBe(4);
+    expect(rollbackLastMigration(database.sqlite)).toBe(3);
+    expect(rollbackLastMigration(database.sqlite)).toBe(2);
+    expect(database.sqlite.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({
+      n: 1,
+    });
+    applyMigrations(database.sqlite, migrations);
+    const fixture = await createFixture();
+    repositories.approvals.create({
+      runId: fixture.run.id,
+      actionType: "workspace.write",
+      actionDescription: "Permit writes",
+      requestedPermissions: ["file.write"],
+      status: "approved",
+      requestedAt: fixedTime,
+      resolvedAt: fixedTime,
+      resolvedBy: "local-user",
+      principalId: "local-user",
+      policyVersion: "policy-v1",
+      expiresAt: "2026-11-05T13:00:00.000Z",
+    });
+    expect(rollbackLastMigration(database.sqlite)).toBe(5);
+    expect(rollbackLastMigration(database.sqlite)).toBe(4);
+    expect(rollbackLastMigration(database.sqlite)).toBe(3);
+    expect(() => rollbackLastMigration(database.sqlite)).toThrow(/discard approval audit state/);
+    expect(database.sqlite.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({
+      n: 2,
+    });
   });
 
   it("uses an isolated data directory when no filename is provided", async () => {
@@ -264,12 +296,166 @@ describe("SQLite database and repositories", () => {
       resolvedAt: null,
       resolvedBy: null,
     });
-    expect(repositories.approvals.resolve(approval.id, "approved", "human:operator").status).toBe(
-      "approved",
+    expect(() => repositories.approvals.resolve(approval.id, "approved", "human:operator")).toThrow(
+      /trusted server-side policy service/,
+    );
+    expect(repositories.approvals.resolve(approval.id, "rejected", "human:operator").status).toBe(
+      "rejected",
     );
     expect(() => repositories.approvals.resolve(approval.id, "rejected", "human:operator")).toThrow(
       RepositoryConflictError,
     );
+  });
+
+  it("binds approval consumption to principal, run, action, policy, expiry and one-time use", async () => {
+    const fixture = await createFixture();
+    const principalId = "local-user-1";
+    const approval = repositories.approvals.create({
+      runId: fixture.run.id,
+      actionType: "workspace.write",
+      actionDescription: "Permit writes to this run workspace",
+      requestedPermissions: ["file.write"],
+      status: "approved",
+      requestedAt: fixedTime,
+      resolvedAt: fixedTime,
+      resolvedBy: principalId,
+      principalId,
+      policyVersion: "policy-v1",
+      expiresAt: "2026-11-05T13:00:00.000Z",
+    });
+    const consumeInput = {
+      id: approval.id,
+      runId: fixture.run.id,
+      principalId,
+      actionType: "workspace.write",
+      policyVersion: "policy-v1",
+      at: fixedTime,
+    };
+    const consume = (input: typeof consumeInput) =>
+      repositories.approvals.consumeWithEvent(input, {
+        runId: fixture.run.id,
+        type: "approval.consumed",
+        occurredAt: fixedTime,
+        data: {
+          approvalId: approval.id,
+          principalId: input.principalId,
+          policyVersion: input.policyVersion,
+          actionType: input.actionType,
+        },
+      });
+    const results = await Promise.allSettled([
+      Promise.resolve().then(() => consume(consumeInput)),
+      Promise.resolve().then(() => consume(consumeInput)),
+    ]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(repositories.approvals.getById(approval.id).consumedAt).toBe(fixedTime);
+    expect(() => consume({ ...consumeInput, principalId: "another-user" })).toThrow(
+      RepositoryConflictError,
+    );
+    expect(() => consume({ ...consumeInput, actionType: "network.access" })).toThrow(
+      RepositoryConflictError,
+    );
+  });
+
+  it("rolls approval consumption back if inserting its audit event fails", async () => {
+    const fixture = await createFixture();
+    const approval = repositories.approvals.create(
+      {
+        runId: fixture.run.id,
+        actionType: "workspace.write",
+        actionDescription: "Permit writes",
+        requestedPermissions: ["file.write"],
+        status: "approved",
+        requestedAt: fixedTime,
+        resolvedAt: fixedTime,
+        resolvedBy: "local-user-1",
+        principalId: "local-user-1",
+        policyVersion: "policy-v1",
+        expiresAt: "2026-11-05T13:00:00.000Z",
+      },
+      randomUUID(),
+    );
+    database.sqlite.exec(`
+      CREATE TRIGGER reject_consumption_audit
+      BEFORE INSERT ON agent_events
+      WHEN NEW.type = 'approval.consumed'
+      BEGIN SELECT RAISE(ABORT, 'audit storage unavailable'); END;
+    `);
+    expect(() =>
+      repositories.approvals.consumeWithEvent(
+        {
+          id: approval.id,
+          runId: fixture.run.id,
+          principalId: "local-user-1",
+          actionType: "workspace.write",
+          policyVersion: "policy-v1",
+          at: fixedTime,
+        },
+        {
+          runId: fixture.run.id,
+          type: "approval.consumed",
+          occurredAt: fixedTime,
+          data: {
+            approvalId: approval.id,
+            principalId: "local-user-1",
+            policyVersion: "policy-v1",
+            actionType: "workspace.write",
+          },
+        },
+      ),
+    ).toThrow();
+    expect(repositories.approvals.getById(approval.id).consumedAt).toBeNull();
+    expect(
+      repositories.events
+        .list({ runId: fixture.run.id })
+        .items.filter((event) => event.type === "approval.consumed"),
+    ).toHaveLength(0);
+  });
+
+  it("rejects expired and revoked approval consumption", async () => {
+    const fixture = await createFixture();
+    const createGrant = (expiresAt: string) =>
+      repositories.approvals.create({
+        runId: fixture.run.id,
+        actionType: "workspace.write",
+        actionDescription: "Permit writes",
+        requestedPermissions: ["file.write"],
+        status: "approved",
+        requestedAt: fixedTime,
+        resolvedAt: fixedTime,
+        resolvedBy: "local-user-1",
+        principalId: "local-user-1",
+        policyVersion: "policy-v1",
+        expiresAt,
+      });
+    const expired = createGrant("2026-11-05T11:59:59.000Z");
+    const revoked = createGrant("2026-11-05T13:00:00.000Z");
+    repositories.approvals.revoke(revoked.id, "local-user-1", fixedTime);
+    const consume = (id: string) =>
+      repositories.approvals.consumeWithEvent(
+        {
+          id,
+          runId: fixture.run.id,
+          principalId: "local-user-1",
+          actionType: "workspace.write",
+          policyVersion: "policy-v1",
+          at: fixedTime,
+        },
+        {
+          runId: fixture.run.id,
+          type: "approval.consumed",
+          occurredAt: fixedTime,
+          data: {
+            approvalId: id,
+            principalId: "local-user-1",
+            policyVersion: "policy-v1",
+            actionType: "workspace.write",
+          },
+        },
+      );
+    expect(() => consume(expired.id)).toThrow(RepositoryConflictError);
+    expect(() => consume(revoked.id)).toThrow(RepositoryConflictError);
   });
 
   it("rolls back a transaction and paginates deterministically", async () => {
@@ -392,6 +578,51 @@ describe("SQLite database and repositories", () => {
     database.close();
   });
 
+  it("provisions one trusted local principal, adopts legacy projects and scopes sessions and runs", async () => {
+    const fixture = await createFixture();
+    expect(database.sqlite.prepare("SELECT id, name FROM principals").all()).toEqual([]);
+    const principal = await repositories.auth.createPrincipal({
+      name: "local-owner",
+      passwordHash: "scrypt$test",
+    });
+    expect(await repositories.auth.findAnyPrincipal()).toEqual(principal);
+    expect(
+      await repositories.auth.getProjectMembership(fixture.project.id, principal.id),
+    ).toMatchObject({ role: "owner" });
+    expect(
+      (await repositories.auth.listOwnedProjects(principal.id)).items.map((item) => item.id),
+    ).toContain(fixture.project.id);
+    expect(await repositories.auth.canAccessRun(fixture.run.id, principal.id)).toBe(true);
+    expect(() =>
+      repositories.auth.createPrincipal({ name: "second-owner", passwordHash: "scrypt$test" }),
+    ).toThrow(/already been created/);
+
+    const stranger = randomUUID();
+    database.sqlite
+      .prepare(
+        "INSERT INTO principals(id, name, auth_source, password_hash, created_at) VALUES (?, 'stranger', 'local_password', 'scrypt$test', ?)",
+      )
+      .run(stranger, fixedTime);
+    expect(await repositories.auth.getProjectMembership(fixture.project.id, stranger)).toBeNull();
+    expect(await repositories.auth.canAccessRun(fixture.run.id, stranger)).toBe(false);
+    await repositories.auth.setRunOwner(fixture.run.id, stranger, fixedTime);
+    expect(await repositories.auth.canAccessRun(fixture.run.id, stranger)).toBe(false);
+    expect(await repositories.auth.canAccessRun(fixture.run.id, principal.id)).toBe(true);
+
+    const tokenHash = "a".repeat(64);
+    const authSession = await repositories.auth.createSession({
+      principalId: principal.id,
+      tokenHash,
+      expiresAt: "2026-11-05T13:00:00.000Z",
+    });
+    expect(await repositories.auth.findSession(tokenHash)).toEqual(authSession);
+    expect(await repositories.auth.revokePrincipal(principal.id, fixedTime)).toBe(true);
+    expect(await repositories.auth.findSession(tokenHash)).toBeNull();
+    expect(await repositories.auth.getPrincipal(principal.id)).toMatchObject({
+      disabledAt: fixedTime,
+    });
+  });
+
   it("serializes writes from two database connections and keeps pagination counts accurate", async () => {
     const other = await openDatabase({ filename: database.filename, now: () => fixedTime });
     const otherRepositories = new Repositories(other);
@@ -412,5 +643,50 @@ describe("SQLite database and repositories", () => {
     expect(new Set(entries.map((entry) => entry.id)).size).toBe(12);
     expect(repositories.projects.list({ limit: 20 }).total).toBe(12);
     other.close();
+  });
+
+  it("allows one worker to claim a run and fences stale generations after takeover", async () => {
+    const { run } = await createFixture();
+    const first = await repositories.leases.claim(
+      run.id,
+      "worker-a",
+      fixedTime,
+      "2026-11-05T12:00:10.000Z",
+    );
+    expect(first?.lease.generation).toBe(1);
+    expect(
+      await repositories.leases.claim(run.id, "worker-b", fixedTime, "2026-11-05T12:00:10.000Z"),
+    ).toBeNull();
+    const takeover = await repositories.leases.claim(
+      run.id,
+      "worker-b",
+      "2026-11-05T12:00:11.000Z",
+      "2026-11-05T12:00:30.000Z",
+    );
+    expect(takeover?.previousGeneration).toBe(1);
+    expect(takeover?.lease.generation).toBe(2);
+    expect(
+      repositories.leases.release(run.id, { workerId: "worker-a", generation: 1 }, fixedTime),
+    ).toBe(false);
+    repositories.events.appendOwned(
+      { runId: run.id, type: "run.started", occurredAt: fixedTime, data: {} },
+      { workerId: "worker-b", generation: 2 },
+      "2026-11-05T12:00:12.000Z",
+    );
+    expect(() =>
+      repositories.events.appendOwned(
+        { runId: run.id, type: "run.started", occurredAt: fixedTime, data: {} },
+        { workerId: "worker-a", generation: 1 },
+        "2026-11-05T12:00:12.000Z",
+      ),
+    ).toThrow(/lease is stale/);
+    expect(() =>
+      repositories.runs.updateOwned(
+        run.id,
+        { error: "stale" },
+        { workerId: "worker-a", generation: 1 },
+        "2026-11-05T12:00:12.000Z",
+      ),
+    ).toThrow(/lease is stale/);
   });
 });

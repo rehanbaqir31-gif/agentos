@@ -1,6 +1,7 @@
 import type {
   Agent,
   Approval,
+  CreateRunArtifact,
   CreateAgent,
   CreateApproval,
   CreateEvaluation,
@@ -14,7 +15,15 @@ import type {
   Project,
   Provider,
   RunManifest,
+  RunArtifact,
+  RunLeaseIdentity,
+  WorkerLease,
+  LeaseClaim,
   Task,
+  Principal,
+  AuthSession,
+  ProjectMembership,
+  ProjectRole,
 } from "./domain.js";
 import type { AgentEvent, CreateAgentEvent } from "./events.js";
 import type { RunStatus } from "./run-lifecycle.js";
@@ -85,29 +94,119 @@ export type TaskRepositoryContract = EntityRepository<
   Partial<Omit<Task, "id" | "createdAt" | "updatedAt">>,
   TaskFilter
 >;
-export type ExecutionRunRepositoryContract = EntityRepository<
+export interface ExecutionRunRepositoryContract extends EntityRepository<
   ExecutionRun,
   CreateExecutionRun,
   Partial<Omit<ExecutionRun, "id" | "createdAt" | "updatedAt">>,
   RunFilter
->;
+> {
+  createWithLease(
+    input: CreateExecutionRun,
+    workerId: string,
+    claimedAt: string,
+    expiresAt: string,
+    id?: string,
+  ): Awaitable<{ run: ExecutionRun; lease: WorkerLease }>;
+  updateOwned(
+    id: string,
+    patch: Partial<Omit<ExecutionRun, "id" | "createdAt" | "updatedAt">>,
+    identity: RunLeaseIdentity,
+    now: string,
+  ): Awaitable<ExecutionRun>;
+}
+
+export interface RunLeaseRepositoryContract {
+  claim(
+    runId: string,
+    workerId: string,
+    now: string,
+    expiresAt: string,
+  ): Awaitable<LeaseClaim | null>;
+  renew(
+    runId: string,
+    identity: RunLeaseIdentity,
+    now: string,
+    expiresAt: string,
+  ): Awaitable<WorkerLease | null>;
+  release(runId: string, identity: RunLeaseIdentity, at: string): Awaitable<boolean>;
+  getByRunId(runId: string): Awaitable<WorkerLease | null>;
+  listExpired(now: string, filter?: PageRequest): Awaitable<Page<WorkerLease>>;
+}
 
 export interface RunManifestRepositoryContract {
   create(input: CreateRunManifest, id?: string): Awaitable<RunManifest>;
+  createOwned(
+    input: CreateRunManifest,
+    identity: RunLeaseIdentity,
+    now: string,
+    id?: string,
+  ): Awaitable<RunManifest>;
   getByRunId(runId: string): Awaitable<RunManifest>;
   list(filter?: PageRequest): Awaitable<Page<RunManifest>>;
 }
 
+export interface RunArtifactRepositoryContract {
+  create(input: CreateRunArtifact, id?: string): Awaitable<RunArtifact>;
+  createOwned(
+    input: CreateRunArtifact,
+    identity: RunLeaseIdentity,
+    now: string,
+    id?: string,
+  ): Awaitable<RunArtifact>;
+  getForProject(runId: string, projectId: string, artifactId: string): Awaitable<RunArtifact>;
+  listForProject(
+    runId: string,
+    projectId: string,
+    filter?: PageRequest,
+  ): Awaitable<Page<RunArtifact>>;
+  totalBytes(runId: string, projectId: string): Awaitable<number>;
+  listStorageLocators(): Awaitable<string[]>;
+  listExpired(before: string, filter?: PageRequest): Awaitable<Page<RunArtifact>>;
+  delete(id: string): Awaitable<RunArtifact | null>;
+}
+
 export interface AgentEventRepositoryContract {
   append(input: CreateAgentEvent, id?: string): Awaitable<AgentEvent>;
+  appendOwned(
+    input: CreateAgentEvent,
+    identity: RunLeaseIdentity,
+    now: string,
+    id?: string,
+  ): Awaitable<AgentEvent>;
   list(filter: EventFilter): Awaitable<Page<AgentEvent>>;
 }
 
 export interface ApprovalRepositoryContract {
   create(input: CreateApproval, id?: string): Awaitable<Approval>;
+  createOwned(
+    input: CreateApproval,
+    identity: RunLeaseIdentity,
+    now: string,
+    id?: string,
+  ): Awaitable<Approval>;
   getById(id: string): Awaitable<Approval>;
   list(runId: string, filter?: PageRequest): Awaitable<Page<Approval>>;
   resolve(id: string, status: "approved" | "rejected", resolvedBy: string): Awaitable<Approval>;
+  resolveOwned(
+    id: string,
+    status: "approved" | "rejected",
+    resolvedBy: string,
+    identity: RunLeaseIdentity,
+    now: string,
+  ): Awaitable<Approval>;
+  consumeWithEvent(
+    input: {
+      id: string;
+      runId: string;
+      principalId: string;
+      actionType: string;
+      policyVersion: string;
+      at: string;
+    },
+    event: Extract<CreateAgentEvent, { type: "approval.consumed" }>,
+    isCancelled?: () => boolean,
+  ): Awaitable<Approval>;
+  revoke(id: string, principalId: string, at: string): Awaitable<Approval>;
 }
 
 export interface EvaluationRepositoryContract {
@@ -116,14 +215,47 @@ export interface EvaluationRepositoryContract {
   list(runId: string, filter?: PageRequest): Awaitable<Page<Evaluation>>;
 }
 
+export interface AuthenticationRepositoryContract {
+  findAnyPrincipal(): Awaitable<Principal | null>;
+  getPrincipalByName(name: string): Awaitable<Principal | null>;
+  getPrincipal(id: string): Awaitable<Principal | null>;
+  verifyPasswordHash(
+    name: string,
+  ): Awaitable<{ principal: Principal; passwordHash: string } | null>;
+  createPrincipal(input: { name: string; passwordHash: string }, id?: string): Awaitable<Principal>;
+  revokePrincipal(id: string, at: string): Awaitable<boolean>;
+  createSession(
+    input: { principalId: string; expiresAt: string; tokenHash: string },
+    id?: string,
+  ): Awaitable<AuthSession>;
+  findSession(tokenHash: string): Awaitable<AuthSession | null>;
+  revokeSession(tokenHash: string, at: string): Awaitable<boolean>;
+  revokePrincipalSessions(principalId: string, at: string): Awaitable<number>;
+  addProjectMember(
+    projectId: string,
+    principalId: string,
+    role: ProjectRole,
+    at: string,
+  ): Awaitable<ProjectMembership>;
+  getProjectMembership(projectId: string, principalId: string): Awaitable<ProjectMembership | null>;
+  listProjectMemberships(projectId: string): Awaitable<ProjectMembership[]>;
+  listOwnedProjects(principalId: string, filter?: ProjectFilter): Awaitable<Page<Project>>;
+  listOwnedRuns(principalId: string, filter?: RunFilter): Awaitable<Page<ExecutionRun>>;
+  setRunOwner(runId: string, principalId: string, at: string): Awaitable<void>;
+  canAccessRun(runId: string, principalId: string): Awaitable<boolean>;
+}
+
 export interface RepositorySet {
   projects: ProjectRepositoryContract;
   agents: AgentRepositoryContract;
   providers: ProviderRepositoryContract;
   tasks: TaskRepositoryContract;
   runs: ExecutionRunRepositoryContract;
+  leases: RunLeaseRepositoryContract;
   manifests: RunManifestRepositoryContract;
+  artifacts: RunArtifactRepositoryContract;
   events: AgentEventRepositoryContract;
   approvals: ApprovalRepositoryContract;
   evaluations: EvaluationRepositoryContract;
+  auth: AuthenticationRepositoryContract;
 }

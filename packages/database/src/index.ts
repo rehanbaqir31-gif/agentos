@@ -1,5 +1,6 @@
 export {
   applyMigrations,
+  rollbackLastMigration,
   DatabaseInitializationError,
   openDatabase,
   type AgentOsDatabase,
@@ -7,6 +8,10 @@ export {
   type DatabaseOptions,
 } from "./database.js";
 export { migrations, type Migration } from "./migrations.js";
+export {
+  SqliteAuthenticationRepository,
+  PostgresAuthenticationRepository,
+} from "./auth-repositories.js";
 export {
   DatabaseConfigurationError,
   loadDatabaseConfig,
@@ -17,6 +22,7 @@ export {
 } from "./database-config.js";
 export {
   applyPostgresMigrations,
+  rollbackLastPostgresMigration,
   openPostgresDatabase,
   PostgresInitializationError,
   type AgentOsPostgresDatabase,
@@ -35,6 +41,7 @@ export {
   PostgresProviderRepository,
   PostgresRepositories,
   PostgresRunManifestRepository,
+  PostgresRunArtifactRepository,
   PostgresTaskRepository,
 } from "./postgres-repositories.js";
 export {
@@ -51,6 +58,7 @@ export {
   RepositoryConflictError,
   RepositoryNotFoundError,
   RunManifestRepository,
+  RunArtifactRepository,
   TaskRepository,
   type EventFilter,
   type Page,

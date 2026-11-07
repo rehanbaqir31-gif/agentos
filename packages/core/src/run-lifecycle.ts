@@ -13,7 +13,7 @@ export const runStatuses = [
 export type RunStatus = (typeof runStatuses)[number];
 
 const transitions: Readonly<Record<RunStatus, readonly RunStatus[]>> = {
-  created: ["validating", "cancelled"],
+  created: ["validating", "failed", "cancelled"],
   validating: ["preparing_workspace", "failed", "cancelled"],
   preparing_workspace: ["queued", "failed", "cancelled"],
   queued: ["running", "failed", "cancelled"],

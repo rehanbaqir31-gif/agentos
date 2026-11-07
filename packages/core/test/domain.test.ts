@@ -4,6 +4,7 @@ import {
   createProviderSchema,
   parseAgentEvent,
   projectSchema,
+  redactEventSecrets,
   runManifestSchema,
   serializeAgentEvent,
 } from "../src/index.js";
@@ -119,5 +120,21 @@ describe("domain schemas", () => {
       code: "provider_error",
       message: "Request failed API_KEY=[REDACTED]",
     });
+  });
+
+  it("redacts common credential formats before event or artifact serialization", () => {
+    const sensitive = [
+      "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+      "github_pat_abcdefghijklmnopqrstuvwxyz0123456789",
+      "xoxb-12345678901234567890-1234567890",
+      "AIza012345678901234567890123456789012345",
+      "AKIA1234567890ABCDEF",
+      "https://user:password@example.test/path",
+      "-----BEGIN PRIVATE KEY-----private-material-----END PRIVATE KEY-----",
+    ].join(" ");
+    const redacted = redactEventSecrets(sensitive);
+    expect(redacted).not.toContain("abcdefghijklmnopqrstuvwxyz0123456789");
+    expect(redacted).not.toContain("private-material");
+    expect(redacted).not.toContain("user:password");
   });
 });

@@ -18,6 +18,7 @@ describe("run lifecycle", () => {
 
   it("allows cancellation and failure from nonterminal execution states", () => {
     expect(canTransitionRun("created", "cancelled")).toBe(true);
+    expect(canTransitionRun("created", "failed")).toBe(true);
     expect(canTransitionRun("running", "cancelled")).toBe(true);
     expect(canTransitionRun("validating", "failed")).toBe(true);
   });

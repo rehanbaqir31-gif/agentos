@@ -1,0 +1,30 @@
+{
+  "name": "@agentos/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check-types": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@agentos/agents": "workspace:*",
+    "@agentos/core": "workspace:*",
+    "@agentos/database": "workspace:*",
+    "@fastify/cookie": "^11.1.5",
+    "@fastify/rate-limit": "10.3.0",
+    "fastify": "^5.12.8",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5"
+  }
+}

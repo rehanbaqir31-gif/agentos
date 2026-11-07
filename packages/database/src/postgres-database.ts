@@ -117,6 +117,50 @@ export async function applyPostgresMigrations(
   }
 }
 
+export async function rollbackLastPostgresMigration(
+  pool: Pool,
+  migrations: readonly PostgresMigration[] = postgresMigrations,
+): Promise<number | null> {
+  const client = await pool.connect();
+  try {
+    await client.query("SELECT pg_advisory_lock(hashtext($1))", ["agentos.schema_migrations"]);
+    const latestResult = await client.query<{ version: number; name: string }>(
+      "SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1",
+    );
+    const latest = latestResult.rows[0];
+    if (!latest) return null;
+    const migration = migrations.find((item) => item.version === latest.version);
+    if (!migration || migration.name !== latest.name || !migration.downSql)
+      throw new PostgresInitializationError(
+        `PostgreSQL migration ${latest.version}:${latest.name} cannot be rolled back`,
+      );
+    if (migration.rollbackCheckSql) {
+      const check = await client.query<{ count: string }>(migration.rollbackCheckSql);
+      if (Number(check.rows[0]?.count ?? 0) > 0)
+        throw new PostgresInitializationError(
+          "Migration rollback would discard approval audit state",
+        );
+    }
+    await withPgTransaction(client, async () => {
+      await client.query(migration.downSql!);
+      await client.query("DELETE FROM schema_migrations WHERE version = $1", [latest.version]);
+    });
+    return latest.version;
+  } catch (error) {
+    if (error instanceof PostgresInitializationError) throw error;
+    throw new PostgresInitializationError("Could not roll back PostgreSQL migration", {
+      cause: error,
+    });
+  } finally {
+    try {
+      await client.query("SELECT pg_advisory_unlock(hashtext($1))", ["agentos.schema_migrations"]);
+    } catch {
+      // The client is released below; a broken connection will be retired by pg.
+    }
+    client.release();
+  }
+}
+
 export async function openPostgresDatabase(
   options: PostgresDatabaseOptions,
 ): Promise<AgentOsPostgresDatabase> {

@@ -11,6 +11,7 @@ export const runManifestIdSchema = id.brand<"RunManifestId">();
 export const approvalIdSchema = id.brand<"ApprovalId">();
 export const evaluationIdSchema = id.brand<"EvaluationId">();
 export const agentEventIdSchema = id.brand<"AgentEventId">();
+export const artifactIdSchema = id.brand<"RunArtifactId">();
 export type ProjectId = z.infer<typeof projectIdSchema>;
 export type AgentId = z.infer<typeof agentIdSchema>;
 export type ProviderId = z.infer<typeof providerIdSchema>;
@@ -20,6 +21,46 @@ export type RunManifestId = z.infer<typeof runManifestIdSchema>;
 export type ApprovalId = z.infer<typeof approvalIdSchema>;
 export type EvaluationId = z.infer<typeof evaluationIdSchema>;
 export type AgentEventId = z.infer<typeof agentEventIdSchema>;
+export type ArtifactId = z.infer<typeof artifactIdSchema>;
+
+export const principalIdSchema = z.string().uuid().brand<"PrincipalId">();
+export const sessionIdSchema = z.string().uuid().brand<"AuthSessionId">();
+export type PrincipalId = z.infer<typeof principalIdSchema>;
+export type AuthSessionId = z.infer<typeof sessionIdSchema>;
+
+export const principalSchema = z
+  .object({
+    id: principalIdSchema,
+    authSource: z.literal("local_password"),
+    createdAt: z.iso.datetime(),
+    disabledAt: z.iso.datetime().nullable(),
+  })
+  .strict();
+export type Principal = z.infer<typeof principalSchema>;
+
+export const sessionSchema = z
+  .object({
+    id: sessionIdSchema,
+    principalId: principalIdSchema,
+    createdAt: z.iso.datetime(),
+    expiresAt: z.iso.datetime(),
+    revokedAt: z.iso.datetime().nullable(),
+  })
+  .strict();
+export type AuthSession = z.infer<typeof sessionSchema>;
+
+export const projectRoleSchema = z.enum(["owner", "maintainer", "viewer"]);
+export type ProjectRole = z.infer<typeof projectRoleSchema>;
+
+export const projectMembershipSchema = z
+  .object({
+    projectId: projectIdSchema,
+    principalId: principalIdSchema,
+    role: projectRoleSchema,
+    createdAt: z.iso.datetime(),
+  })
+  .strict();
+export type ProjectMembership = z.infer<typeof projectMembershipSchema>;
 const timestamp = z.iso.datetime();
 const name = z.string().trim().min(1).max(200);
 const description = z.string().max(20_000);
@@ -214,6 +255,44 @@ export const createExecutionRunSchema = executionRunBaseSchema.omit({
 });
 export type CreateExecutionRun = z.input<typeof createExecutionRunSchema>;
 
+export const workerIdSchema = z.string().trim().min(1).max(256);
+export const leaseGenerationSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+export const runLeaseIdentitySchema = z
+  .object({ workerId: workerIdSchema, generation: leaseGenerationSchema })
+  .strict();
+export type RunLeaseIdentity = z.infer<typeof runLeaseIdentitySchema>;
+export const workerLeaseSchema = z
+  .object({
+    runId: runIdSchema,
+    workerId: workerIdSchema,
+    generation: leaseGenerationSchema,
+    claimedAt: timestamp,
+    heartbeatAt: timestamp,
+    expiresAt: timestamp,
+    releasedAt: timestamp.nullable(),
+  })
+  .strict()
+  .superRefine((lease, context) => {
+    if (Date.parse(lease.heartbeatAt) < Date.parse(lease.claimedAt))
+      context.addIssue({
+        code: "custom",
+        path: ["heartbeatAt"],
+        message: "Heartbeat precedes claim",
+      });
+    if (Date.parse(lease.expiresAt) <= Date.parse(lease.claimedAt))
+      context.addIssue({
+        code: "custom",
+        path: ["expiresAt"],
+        message: "Lease expiry must follow claim",
+      });
+  });
+export type WorkerLease = z.infer<typeof workerLeaseSchema>;
+export interface LeaseClaim {
+  lease: WorkerLease;
+  /** The expired/released generation whose resources may be reconciled by this claim. */
+  previousGeneration: number | null;
+}
+
 export const runManifestSchema = z
   .object({
     id: runManifestIdSchema,
@@ -251,6 +330,91 @@ export type RunManifest = z.infer<typeof runManifestSchema>;
 export const createRunManifestSchema = runManifestSchema.omit({ id: true, createdAt: true });
 export type CreateRunManifest = z.input<typeof createRunManifestSchema>;
 
+export const runArtifactTypeSchema = z.enum([
+  "git_diff",
+  "stdout",
+  "stderr",
+  "test_results",
+  "execution_manifest",
+  "result_metadata",
+]);
+export const artifactCollectionStatusSchema = z.enum([
+  "complete",
+  "truncated",
+  "failed",
+  "unavailable",
+]);
+const runArtifactBaseSchema = z
+  .object({
+    id: artifactIdSchema,
+    runId: runIdSchema,
+    projectId: projectIdSchema,
+    type: runArtifactTypeSchema,
+    logicalName: z.string().min(1).max(256),
+    contentType: z.string().min(1).max(128),
+    byteSize: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    sha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/i)
+      .nullable(),
+    createdAt: timestamp,
+    storageLocator: z
+      .string()
+      .regex(/^[a-f0-9]{2}\/[a-f0-9-]{36}\.artifact$/i)
+      .nullable(),
+    collectionStatus: artifactCollectionStatusSchema,
+    collectionError: z.string().max(4_000).nullable(),
+  })
+  .strict();
+export const runArtifactSchema = runArtifactBaseSchema.superRefine((artifact, context) => {
+  if (
+    artifact.storageLocator !== null &&
+    artifact.storageLocator !== `${artifact.id.slice(0, 2)}/${artifact.id}.artifact`
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["storageLocator"],
+      message: "Artifact locator must be derived from its ID",
+    });
+  }
+  if (
+    (artifact.collectionStatus === "complete" || artifact.collectionStatus === "truncated") &&
+    (artifact.storageLocator === null || artifact.sha256 === null || artifact.collectionError)
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["collectionStatus"],
+      message: "Stored artifacts require a locator and digest without a collection error",
+    });
+  }
+  if (
+    artifact.collectionStatus === "unavailable" &&
+    (artifact.byteSize !== 0 ||
+      artifact.sha256 !== null ||
+      artifact.storageLocator !== null ||
+      !artifact.collectionError)
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["collectionStatus"],
+      message: "Unavailable artifacts cannot report captured bytes or a digest",
+    });
+  }
+  if (
+    artifact.collectionStatus === "failed" &&
+    (!artifact.collectionError || artifact.storageLocator !== null)
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["collectionError"],
+      message: "Failed collection requires an error description",
+    });
+  }
+});
+export type RunArtifact = z.infer<typeof runArtifactSchema>;
+export const createRunArtifactSchema = runArtifactBaseSchema.omit({ id: true, createdAt: true });
+export type CreateRunArtifact = z.input<typeof createRunArtifactSchema>;
+
 export const approvalStatusSchema = z.enum(["pending", "approved", "rejected"]);
 const approvalBaseSchema = z
   .object({
@@ -263,6 +427,11 @@ const approvalBaseSchema = z
     requestedAt: timestamp,
     resolvedAt: timestamp.nullable(),
     resolvedBy: z.string().max(256).nullable(),
+    principalId: z.string().min(1).max(256).nullable().default(null),
+    policyVersion: z.string().min(1).max(128).nullable().default(null),
+    expiresAt: timestamp.nullable().default(null),
+    consumedAt: timestamp.nullable().default(null),
+    revokedAt: timestamp.nullable().default(null),
   })
   .strict();
 export const approvalSchema = approvalBaseSchema.superRefine((approval, context) => {
@@ -284,6 +453,33 @@ export const approvalSchema = approvalBaseSchema.superRefine((approval, context)
       code: "custom",
       path: ["resolvedAt"],
       message: "Resolved approvals require resolver and time",
+    });
+  }
+  if (approval.consumedAt !== null && approval.status !== "approved") {
+    context.addIssue({
+      code: "custom",
+      path: ["consumedAt"],
+      message: "Only an approved authorization can be consumed",
+    });
+  }
+  if (approval.revokedAt !== null && approval.status !== "approved") {
+    context.addIssue({
+      code: "custom",
+      path: ["revokedAt"],
+      message: "Only an approved authorization can be revoked",
+    });
+  }
+  if (
+    approval.principalId !== null &&
+    approval.status === "approved" &&
+    (approval.resolvedBy !== approval.principalId ||
+      approval.policyVersion === null ||
+      approval.expiresAt === null)
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["principalId"],
+      message: "Bound approvals require matching resolver, policy version and expiry",
     });
   }
 });

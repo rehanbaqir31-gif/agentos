@@ -21,8 +21,88 @@ export const agentEventSchema = z.discriminatedUnion("type", [
   z
     .object({
       ...base,
+      type: z.literal("run.recovered"),
+      data: z
+        .object({
+          workerId: z.string().min(1).max(256),
+          generation: z.number().int().positive(),
+          previousGeneration: z.number().int().positive().nullable(),
+          cleanupErrors: z.array(z.string().max(2_000)).max(16),
+        })
+        .strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...base,
       type: z.literal("run.completed"),
       data: z.object({ summary: z.string().max(20_000).nullable() }).strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...base,
+      type: z.literal("session.attached"),
+      data: z.object({ sessionId: z.string().min(1).max(256) }).strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...base,
+      type: z.literal("file.changed"),
+      data: z.object({ path: z.string().min(1).max(4096) }).strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...base,
+      type: z.literal("run.result"),
+      data: z
+        .object({
+          summary: z.string().max(20_000).nullable(),
+          diffSha256: z
+            .string()
+            .regex(/^[a-f0-9]{64}$/i)
+            .nullable(),
+          files: z
+            .array(
+              z
+                .object({
+                  path: z.string().min(1).max(4096),
+                  sha256: z
+                    .string()
+                    .regex(/^[a-f0-9]{64}$/i)
+                    .nullable(),
+                })
+                .strict(),
+            )
+            .max(10_000),
+          artifacts: z
+            .array(
+              z
+                .object({
+                  id: z.string().uuid(),
+                  type: z.enum([
+                    "git_diff",
+                    "stdout",
+                    "stderr",
+                    "test_results",
+                    "execution_manifest",
+                    "result_metadata",
+                  ]),
+                  collectionStatus: z.enum(["complete", "truncated", "failed", "unavailable"]),
+                  byteSize: z.number().int().nonnegative(),
+                  sha256: z
+                    .string()
+                    .regex(/^[a-f0-9]{64}$/i)
+                    .nullable(),
+                })
+                .strict(),
+            )
+            .max(32)
+            .optional(),
+        })
+        .strict(),
     })
     .strict(),
   z
@@ -118,6 +198,19 @@ export const agentEventSchema = z.discriminatedUnion("type", [
   z
     .object({
       ...base,
+      type: z.literal("approval.granted"),
+      data: z
+        .object({
+          approvalId: approvalIdSchema,
+          principalId: z.string().min(1).max(256),
+          policyVersion: z.string().min(1).max(128),
+        })
+        .strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...base,
       type: z.literal("approval.approved"),
       data: z
         .object({ approvalId: approvalIdSchema, resolvedBy: z.string().min(1).max(256) })
@@ -130,6 +223,33 @@ export const agentEventSchema = z.discriminatedUnion("type", [
       type: z.literal("approval.rejected"),
       data: z
         .object({ approvalId: approvalIdSchema, resolvedBy: z.string().min(1).max(256) })
+        .strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...base,
+      type: z.literal("approval.consumed"),
+      data: z
+        .object({
+          approvalId: approvalIdSchema,
+          principalId: z.string().min(1).max(256),
+          policyVersion: z.string().min(1).max(128),
+          actionType: z.string().min(1).max(128),
+        })
+        .strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...base,
+      type: z.literal("approval.revoked"),
+      data: z
+        .object({
+          approvalId: approvalIdSchema,
+          principalId: z.string().min(1).max(256),
+          policyVersion: z.string().min(1).max(128),
+        })
         .strict(),
     })
     .strict(),
@@ -169,9 +289,7 @@ export const agentEventSchema = z.discriminatedUnion("type", [
 ]);
 
 export type AgentEvent = z.infer<typeof agentEventSchema>;
-type WithoutEventMetadata<T> = T extends { id: string; sequence: number }
-  ? Omit<T, "id" | "sequence">
-  : never;
+type WithoutEventMetadata<T> = T extends unknown ? Omit<T, "id" | "sequence"> : never;
 export type CreateAgentEvent = WithoutEventMetadata<AgentEvent>;
 export const createAgentEventSchema: z.ZodType<CreateAgentEvent> = z.custom<CreateAgentEvent>(
   (value) => {
@@ -193,7 +311,16 @@ export function redactEventSecrets<T>(value: T): T {
         /\b((?:api[_-]?key|password|secret|token|authorization)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
         "$1[REDACTED]",
       )
-      .replace(/\bsk-[A-Za-z0-9_-]{12,}/gi, "[REDACTED]") as T;
+      .replace(
+        /\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|AIza[A-Za-z0-9_-]{30,})\b/gi,
+        "[REDACTED]",
+      )
+      .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "[REDACTED]")
+      .replace(
+        /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g,
+        "[REDACTED PRIVATE KEY]",
+      )
+      .replace(/\b(https?:\/\/)[^\s/@:]+:[^\s/@]+@/gi, "$1[REDACTED]@") as T;
   }
   if (Array.isArray(value)) return value.map((entry) => redactEventSecrets(entry)) as T;
   if (typeof value === "object" && value !== null) {

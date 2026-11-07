@@ -2,10 +2,13 @@ import { relations, sql } from "drizzle-orm";
 import {
   boolean,
   check,
+  foreignKey,
   index,
   integer,
+  bigint,
   jsonb,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   uniqueIndex,
@@ -19,6 +22,8 @@ import type {
   Project,
   Provider,
   RunManifest,
+  RunArtifact,
+  WorkerLease,
   Task,
 } from "@agentos/core";
 
@@ -41,6 +46,48 @@ export const pgProjects = pgTable(
   (table) => [
     uniqueIndex("projects_repository_path_uq").on(table.repositoryPath),
     index("projects_created_at_idx").on(table.createdAt),
+  ],
+);
+
+export const pgPrincipals = pgTable("principals", {
+  id: uuid("id").primaryKey(),
+  name: text("name").notNull().unique(),
+  authSource: text("auth_source", { enum: ["local_password"] }).notNull(),
+  passwordHash: text("password_hash").notNull(),
+  createdAt: utcTimestamp("created_at").notNull(),
+  disabledAt: utcTimestamp("disabled_at"),
+});
+
+export const pgAuthSessions = pgTable(
+  "auth_sessions",
+  {
+    id: uuid("id").primaryKey(),
+    principalId: uuid("principal_id")
+      .notNull()
+      .references(() => pgPrincipals.id, { onDelete: "cascade" }),
+    tokenHash: text("token_hash").notNull().unique(),
+    createdAt: utcTimestamp("created_at").notNull(),
+    expiresAt: utcTimestamp("expires_at").notNull(),
+    revokedAt: utcTimestamp("revoked_at"),
+  },
+  (table) => [index("auth_sessions_principal_idx").on(table.principalId, table.expiresAt)],
+);
+
+export const pgProjectMemberships = pgTable(
+  "project_memberships",
+  {
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => pgProjects.id, { onDelete: "cascade" }),
+    principalId: uuid("principal_id")
+      .notNull()
+      .references(() => pgPrincipals.id, { onDelete: "cascade" }),
+    role: text("role", { enum: ["owner", "maintainer", "viewer"] }).notNull(),
+    createdAt: utcTimestamp("created_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.projectId, table.principalId] }),
+    index("project_memberships_principal_idx").on(table.principalId, table.projectId),
   ],
 );
 
@@ -169,6 +216,30 @@ export const pgExecutionRuns = pgTable(
     ),
     index("execution_runs_project_created_idx").on(table.projectId, table.createdAt),
     index("execution_runs_task_idx").on(table.taskId),
+    uniqueIndex("execution_runs_id_project_id_uq").on(table.id, table.projectId),
+  ],
+);
+
+export const pgRunLeases = pgTable(
+  "run_leases",
+  {
+    runId: uuid("run_id")
+      .primaryKey()
+      .references(() => pgExecutionRuns.id, { onDelete: "restrict" }),
+    workerId: text("worker_id").notNull(),
+    generation: bigint("generation", { mode: "number" })
+      .$type<WorkerLease["generation"]>()
+      .notNull(),
+    claimedAt: utcTimestamp("claimed_at").notNull(),
+    heartbeatAt: utcTimestamp("heartbeat_at").notNull(),
+    expiresAt: utcTimestamp("expires_at").notNull(),
+    releasedAt: utcTimestamp("released_at"),
+  },
+  (table) => [
+    check("run_leases_generation_check", sql`${table.generation} > 0`),
+    check("run_leases_heartbeat_check", sql`${table.heartbeatAt} >= ${table.claimedAt}`),
+    check("run_leases_expiry_check", sql`${table.expiresAt} > ${table.claimedAt}`),
+    index("run_leases_expiration_idx").on(table.releasedAt, table.expiresAt, table.runId),
   ],
 );
 
@@ -241,6 +312,50 @@ export const pgRunEventCounters = pgTable(
   (table) => [check("run_event_counters_sequence_check", sql`${table.lastSequence} > 0`)],
 );
 
+export const pgRunArtifacts = pgTable(
+  "run_artifacts",
+  {
+    id: uuid("id").primaryKey(),
+    runId: uuid("run_id").notNull(),
+    projectId: uuid("project_id").notNull(),
+    type: text("artifact_type", {
+      enum: [
+        "git_diff",
+        "stdout",
+        "stderr",
+        "test_results",
+        "execution_manifest",
+        "result_metadata",
+      ],
+    }).notNull(),
+    logicalName: text("logical_name").notNull(),
+    contentType: text("content_type").notNull(),
+    byteSize: bigint("byte_size", { mode: "number" }).$type<RunArtifact["byteSize"]>().notNull(),
+    sha256: text("sha256"),
+    createdAt: utcTimestamp("created_at").notNull(),
+    storageLocator: text("storage_locator"),
+    collectionStatus: text("collection_status", {
+      enum: ["complete", "truncated", "failed", "unavailable"],
+    }).notNull(),
+    collectionError: text("collection_error"),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.runId, table.projectId],
+      foreignColumns: [pgExecutionRuns.id, pgExecutionRuns.projectId],
+      name: "run_artifacts_run_project_fk",
+    }).onDelete("restrict"),
+    check("run_artifacts_byte_size_check", sql`${table.byteSize} >= 0`),
+    check(
+      "run_artifacts_integrity_check",
+      sql`(${table.collectionStatus} IN ('complete', 'truncated') AND ${table.storageLocator} IS NOT NULL AND ${table.sha256} IS NOT NULL AND ${table.collectionError} IS NULL) OR (${table.collectionStatus} = 'failed' AND ${table.storageLocator} IS NULL AND ${table.collectionError} IS NOT NULL) OR (${table.collectionStatus} = 'unavailable' AND ${table.byteSize} = 0 AND ${table.sha256} IS NULL AND ${table.storageLocator} IS NULL AND ${table.collectionError} IS NOT NULL)`,
+    ),
+    uniqueIndex("run_artifacts_run_type_name_uq").on(table.runId, table.type, table.logicalName),
+    index("run_artifacts_run_created_idx").on(table.runId, table.createdAt, table.id),
+    index("run_artifacts_project_created_idx").on(table.projectId, table.createdAt, table.id),
+  ],
+);
+
 export const pgApprovals = pgTable(
   "approvals",
   {
@@ -257,6 +372,11 @@ export const pgApprovals = pgTable(
     requestedAt: utcTimestamp("requested_at").notNull(),
     resolvedAt: utcTimestamp("resolved_at"),
     resolvedBy: text("resolved_by"),
+    principalId: text("principal_id"),
+    policyVersion: text("policy_version"),
+    expiresAt: utcTimestamp("expires_at"),
+    consumedAt: utcTimestamp("consumed_at"),
+    revokedAt: utcTimestamp("revoked_at"),
   },
   (table) => [
     check("approvals_status_check", sql`${table.status} in ('pending', 'approved', 'rejected')`),
@@ -285,6 +405,20 @@ export const pgEvaluations = pgTable(
   (table) => [index("evaluations_run_created_idx").on(table.runId, table.createdAt)],
 );
 
+export const pgRunOwners = pgTable(
+  "run_owners",
+  {
+    runId: uuid("run_id")
+      .primaryKey()
+      .references(() => pgExecutionRuns.id, { onDelete: "restrict" }),
+    principalId: uuid("principal_id")
+      .notNull()
+      .references(() => pgPrincipals.id, { onDelete: "restrict" }),
+    createdAt: utcTimestamp("created_at").notNull(),
+  },
+  (table) => [index("run_owners_principal_idx").on(table.principalId, table.runId)],
+);
+
 export const pgExecutionRunsRelations = relations(pgExecutionRuns, ({ one, many }) => ({
   project: one(pgProjects, { fields: [pgExecutionRuns.projectId], references: [pgProjects.id] }),
   task: one(pgTasks, { fields: [pgExecutionRuns.taskId], references: [pgTasks.id] }),
@@ -299,5 +433,7 @@ export const pgExecutionRunsRelations = relations(pgExecutionRuns, ({ one, many 
   }),
   events: many(pgAgentEvents),
   approvals: many(pgApprovals),
+  artifacts: many(pgRunArtifacts),
+  lease: one(pgRunLeases),
   evaluations: many(pgEvaluations),
 }));

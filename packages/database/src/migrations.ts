@@ -2,6 +2,8 @@ export interface Migration {
   version: number;
   name: string;
   sql: string;
+  downSql?: string;
+  rollbackCheckSql?: string;
 }
 
 export const migrations: readonly Migration[] = [
@@ -150,5 +152,125 @@ CREATE TABLE evaluations (
 );
 CREATE INDEX evaluations_run_created_idx ON evaluations(run_id, created_at);
 `,
+  },
+  {
+    version: 2,
+    name: "approval_identity_and_consumption",
+    sql: `
+ALTER TABLE approvals ADD COLUMN principal_id TEXT;
+ALTER TABLE approvals ADD COLUMN policy_version TEXT;
+ALTER TABLE approvals ADD COLUMN expires_at TEXT;
+ALTER TABLE approvals ADD COLUMN consumed_at TEXT;
+ALTER TABLE approvals ADD COLUMN revoked_at TEXT;
+CREATE INDEX approvals_run_principal_status_idx ON approvals(run_id, principal_id, status);
+`,
+    downSql: `
+DROP INDEX approvals_run_principal_status_idx;
+ALTER TABLE approvals DROP COLUMN revoked_at;
+ALTER TABLE approvals DROP COLUMN consumed_at;
+ALTER TABLE approvals DROP COLUMN expires_at;
+ALTER TABLE approvals DROP COLUMN policy_version;
+ALTER TABLE approvals DROP COLUMN principal_id;
+`,
+    rollbackCheckSql: `SELECT COUNT(*) AS count FROM approvals WHERE principal_id IS NOT NULL OR policy_version IS NOT NULL OR expires_at IS NOT NULL OR consumed_at IS NOT NULL OR revoked_at IS NOT NULL`,
+  },
+  {
+    version: 3,
+    name: "run_artifact_metadata",
+    sql: `
+CREATE UNIQUE INDEX execution_runs_id_project_id_uq ON execution_runs(id, project_id);
+CREATE TABLE run_artifacts (
+  id TEXT PRIMARY KEY NOT NULL,
+  run_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  artifact_type TEXT NOT NULL CHECK (artifact_type IN ('git_diff', 'stdout', 'stderr', 'test_results', 'execution_manifest', 'result_metadata')),
+  logical_name TEXT NOT NULL,
+  content_type TEXT NOT NULL,
+  byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+  sha256 TEXT CHECK (sha256 IS NULL OR (length(sha256) = 64 AND sha256 NOT GLOB '*[^a-fA-F0-9]*')),
+  created_at TEXT NOT NULL,
+  storage_locator TEXT,
+  collection_status TEXT NOT NULL CHECK (collection_status IN ('complete', 'truncated', 'failed', 'unavailable')),
+  collection_error TEXT,
+  UNIQUE (run_id, artifact_type, logical_name),
+  FOREIGN KEY (run_id, project_id) REFERENCES execution_runs(id, project_id) ON DELETE RESTRICT,
+  CHECK ((collection_status IN ('complete', 'truncated') AND storage_locator IS NOT NULL AND sha256 IS NOT NULL AND collection_error IS NULL) OR (collection_status = 'failed' AND storage_locator IS NULL AND collection_error IS NOT NULL) OR (collection_status = 'unavailable' AND byte_size = 0 AND sha256 IS NULL AND storage_locator IS NULL AND collection_error IS NOT NULL))
+);
+CREATE INDEX run_artifacts_run_created_idx ON run_artifacts(run_id, created_at, id);
+CREATE INDEX run_artifacts_project_created_idx ON run_artifacts(project_id, created_at, id);
+`,
+    downSql: `
+DROP TABLE run_artifacts;
+DROP INDEX execution_runs_id_project_id_uq;
+`,
+    rollbackCheckSql: "SELECT COUNT(*) AS count FROM run_artifacts",
+  },
+  {
+    version: 4,
+    name: "durable_worker_run_leases",
+    sql: `
+CREATE TABLE run_leases (
+  run_id TEXT PRIMARY KEY NOT NULL REFERENCES execution_runs(id) ON DELETE RESTRICT,
+  worker_id TEXT NOT NULL CHECK (length(worker_id) BETWEEN 1 AND 256),
+  generation INTEGER NOT NULL CHECK (generation > 0),
+  claimed_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  released_at TEXT,
+  CHECK (heartbeat_at >= claimed_at),
+  CHECK (expires_at > claimed_at)
+);
+CREATE INDEX run_leases_expiration_idx ON run_leases(released_at, expires_at, run_id);
+`,
+    downSql: `
+DROP TABLE run_leases;
+`,
+    rollbackCheckSql: "SELECT COUNT(*) AS count FROM run_leases",
+  },
+  {
+    version: 5,
+    name: "trusted_principals_sessions_and_ownership",
+    sql: `
+CREATE TABLE principals (
+  id TEXT PRIMARY KEY NOT NULL,
+  name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+  auth_source TEXT NOT NULL CHECK (auth_source = 'local_password'),
+  password_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  disabled_at TEXT
+);
+CREATE TABLE auth_sessions (
+  id TEXT PRIMARY KEY NOT NULL,
+  principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT,
+  CHECK (expires_at > created_at)
+);
+CREATE INDEX auth_sessions_principal_idx ON auth_sessions(principal_id, expires_at);
+CREATE TABLE project_memberships (
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+  role TEXT NOT NULL CHECK (role IN ('owner', 'maintainer', 'viewer')),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (project_id, principal_id)
+);
+CREATE INDEX project_memberships_principal_idx ON project_memberships(principal_id, project_id);
+CREATE TABLE run_owners (
+  run_id TEXT PRIMARY KEY NOT NULL REFERENCES execution_runs(id) ON DELETE RESTRICT,
+  principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX run_owners_principal_idx ON run_owners(principal_id, run_id);
+`,
+    downSql: `
+DROP TABLE run_owners;
+DROP TABLE project_memberships;
+DROP TABLE auth_sessions;
+DROP TABLE principals;
+`,
+    rollbackCheckSql:
+      "SELECT (SELECT count(*) FROM principals) + (SELECT count(*) FROM auth_sessions) + (SELECT count(*) FROM project_memberships) + (SELECT count(*) FROM run_owners) AS count",
   },
 ];

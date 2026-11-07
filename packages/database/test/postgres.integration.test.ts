@@ -3,7 +3,11 @@ import { Pool } from "pg";
 import { PGlite } from "@electric-sql/pglite";
 import { PGLiteSocketServer } from "@electric-sql/pglite-socket";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { openPostgresDatabase, applyPostgresMigrations } from "../src/postgres-database.js";
+import {
+  openPostgresDatabase,
+  applyPostgresMigrations,
+  rollbackLastPostgresMigration,
+} from "../src/postgres-database.js";
 import type { AgentOsPostgresDatabase } from "../src/postgres-database.js";
 import { PostgresRepositories } from "../src/postgres-repositories.js";
 import { postgresMigrations } from "../src/postgres-migrations.js";
@@ -127,12 +131,50 @@ describe(`PostgreSQL persistence (${testMode})`, () => {
     const rows = await database.pool.query(
       "SELECT version FROM schema_migrations ORDER BY version",
     );
-    expect(rows.rows).toEqual([{ version: 1 }]);
+    expect(rows.rows).toEqual([
+      { version: 1 },
+      { version: 2 },
+      { version: 3 },
+      { version: 4 },
+      { version: 5 },
+    ]);
     await expect(
       applyPostgresMigrations(database.pool, [
         { ...postgresMigrations[0]!, sql: `${postgresMigrations[0]!.sql}\n-- changed` },
       ]),
     ).rejects.toThrow("has changed");
+  });
+
+  it("reverses the additive approval migration only before approval audit data is written", async () => {
+    expect(await rollbackLastPostgresMigration(database.pool)).toBe(5);
+    expect(await rollbackLastPostgresMigration(database.pool)).toBe(4);
+    expect(await rollbackLastPostgresMigration(database.pool)).toBe(3);
+    expect(await rollbackLastPostgresMigration(database.pool)).toBe(2);
+    const remaining = await database.pool.query(
+      "SELECT version FROM schema_migrations ORDER BY version",
+    );
+    expect(remaining.rows).toEqual([{ version: 1 }]);
+    await applyPostgresMigrations(database.pool, postgresMigrations);
+    const fixture = await createFixture();
+    await repositories.approvals.create({
+      runId: fixture.run.id,
+      actionType: "workspace.write",
+      actionDescription: "Permit writes",
+      requestedPermissions: ["file.write"],
+      status: "approved",
+      requestedAt: fixedTime,
+      resolvedAt: fixedTime,
+      resolvedBy: "pg-user",
+      principalId: "pg-user",
+      policyVersion: "policy-v1",
+      expiresAt: "2026-11-05T13:00:00.000Z",
+    });
+    expect(await rollbackLastPostgresMigration(database.pool)).toBe(5);
+    expect(await rollbackLastPostgresMigration(database.pool)).toBe(4);
+    expect(await rollbackLastPostgresMigration(database.pool)).toBe(3);
+    await expect(rollbackLastPostgresMigration(database.pool)).rejects.toThrow(
+      /discard approval audit state/,
+    );
   });
 
   it("rolls back a failed migration without leaving partial DDL", async () => {
@@ -156,6 +198,45 @@ describe(`PostgreSQL persistence (${testMode})`, () => {
     expect(migration.rows).toHaveLength(0);
   });
 
+  it("serializes concurrent lease claims and fences stale worker generations", async () => {
+    const { run } = await createFixture();
+    const expiration = "2026-11-05T12:00:10.000Z";
+    const claims = await Promise.all([
+      repositories.leases.claim(run.id, "worker-a", fixedTime, expiration),
+      repositories.leases.claim(run.id, "worker-b", fixedTime, expiration),
+    ]);
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    const owner = claims.find(Boolean)!;
+    const takeover = await repositories.leases.claim(
+      run.id,
+      "worker-c",
+      "2026-11-05T12:00:11.000Z",
+      "2026-11-05T12:00:30.000Z",
+    );
+    expect(takeover?.previousGeneration).toBe(owner.lease.generation);
+    expect(takeover?.lease.generation).toBe(owner.lease.generation + 1);
+    const identity = { workerId: takeover!.lease.workerId, generation: takeover!.lease.generation };
+    await repositories.events.appendOwned(
+      { runId: run.id, type: "run.started", occurredAt: fixedTime, data: {} },
+      identity,
+      "2026-11-05T12:00:12.000Z",
+    );
+    await expect(
+      repositories.events.appendOwned(
+        { runId: run.id, type: "run.started", occurredAt: fixedTime, data: {} },
+        { workerId: owner.lease.workerId, generation: owner.lease.generation },
+        "2026-11-05T12:00:12.000Z",
+      ),
+    ).rejects.toThrow(/lease is stale/);
+    const updated = await repositories.runs.updateOwned(
+      run.id,
+      { status: "validating" },
+      identity,
+      "2026-11-05T12:00:12.000Z",
+    );
+    expect(updated.status).toBe("validating");
+  });
+
   it("creates and retrieves projects, agents, providers, tasks, and runs", async () => {
     const fixture = await createFixture();
     expect(await repositories.projects.getById(fixture.project.id)).toEqual(fixture.project);
@@ -163,6 +244,49 @@ describe(`PostgreSQL persistence (${testMode})`, () => {
     expect(await repositories.providers.getById(fixture.provider.id)).toEqual(fixture.provider);
     expect(await repositories.tasks.getById(fixture.task.id)).toEqual(fixture.task);
     expect(await repositories.runs.getById(fixture.run.id)).toEqual(fixture.run);
+  });
+
+  it("provisions trusted principal ownership, sessions, and run authorization", async () => {
+    const fixture = await createFixture();
+    const principal = await repositories.auth.createPrincipal({
+      name: "pg-owner",
+      passwordHash: "scrypt$test",
+    });
+    expect(await repositories.auth.findAnyPrincipal()).toEqual(principal);
+    expect(
+      await repositories.auth.getProjectMembership(fixture.project.id, principal.id),
+    ).toMatchObject({ role: "owner" });
+    expect(
+      (await repositories.auth.listOwnedProjects(principal.id)).items.map((item) => item.id),
+    ).toContain(fixture.project.id);
+    expect(await repositories.auth.canAccessRun(fixture.run.id, principal.id)).toBe(true);
+    await expect(
+      repositories.auth.createPrincipal({ name: "second-owner", passwordHash: "scrypt$test" }),
+    ).rejects.toThrow(/already been created/);
+
+    const stranger = randomUUID();
+    await database.pool.query(
+      "INSERT INTO principals(id, name, auth_source, password_hash, created_at) VALUES ($1, 'pg-stranger', 'local_password', 'scrypt$test', $2)",
+      [stranger, fixedTime],
+    );
+    expect(await repositories.auth.getProjectMembership(fixture.project.id, stranger)).toBeNull();
+    expect(await repositories.auth.canAccessRun(fixture.run.id, stranger)).toBe(false);
+    await repositories.auth.setRunOwner(fixture.run.id, stranger, fixedTime);
+    expect(await repositories.auth.canAccessRun(fixture.run.id, stranger)).toBe(false);
+    expect(await repositories.auth.canAccessRun(fixture.run.id, principal.id)).toBe(true);
+
+    const tokenHash = "b".repeat(64);
+    const session = await repositories.auth.createSession({
+      principalId: principal.id,
+      tokenHash,
+      expiresAt: "2026-11-05T13:00:00.000Z",
+    });
+    expect(await repositories.auth.findSession(tokenHash)).toEqual(session);
+    expect(await repositories.auth.revokePrincipal(principal.id, fixedTime)).toBe(true);
+    expect(await repositories.auth.findSession(tokenHash)).toBeNull();
+    expect(await repositories.auth.getPrincipal(principal.id)).toMatchObject({
+      disabledAt: fixedTime,
+    });
   });
 
   it("persists an immutable manifest and enforces its run relationship", async () => {
@@ -193,6 +317,98 @@ describe(`PostgreSQL persistence (${testMode})`, () => {
       ]),
     ).rejects.toMatchObject({ code: "23503" });
     await expect(repositories.runs.update(fixture.run.id, { modelId: "other" })).rejects.toThrow();
+  });
+
+  it("persists scoped result artifacts, validates relationships, and paginates metadata", async () => {
+    const fixture = await createFixture();
+    const diffId = randomUUID();
+    const stdoutId = randomUUID();
+    const diff = await repositories.artifacts.create(
+      {
+        runId: fixture.run.id,
+        projectId: fixture.project.id,
+        type: "git_diff",
+        logicalName: "patch.diff",
+        contentType: "text/x-diff",
+        byteSize: 128,
+        sha256: "a".repeat(64),
+        storageLocator: `${diffId.slice(0, 2)}/${diffId}.artifact`,
+        collectionStatus: "complete",
+        collectionError: null,
+      },
+      diffId,
+    );
+    const stdout = await repositories.artifacts.create(
+      {
+        runId: fixture.run.id,
+        projectId: fixture.project.id,
+        type: "stdout",
+        logicalName: "stdout.txt",
+        contentType: "text/plain; charset=utf-8",
+        byteSize: 0,
+        sha256: null,
+        storageLocator: null,
+        collectionStatus: "unavailable",
+        collectionError: "Adapter did not expose process stdout",
+      },
+      stdoutId,
+    );
+    expect(
+      await repositories.artifacts.getForProject(fixture.run.id, fixture.project.id, diffId),
+    ).toEqual(diff);
+    expect(
+      (
+        await repositories.artifacts.listForProject(fixture.run.id, fixture.project.id, {
+          limit: 1,
+        })
+      ).total,
+    ).toBe(2);
+    expect(
+      (
+        await repositories.artifacts.listForProject(fixture.run.id, fixture.project.id, {
+          limit: 1,
+        })
+      ).items,
+    ).toHaveLength(1);
+    expect(await repositories.artifacts.totalBytes(fixture.run.id, fixture.project.id)).toBe(128);
+    expect(await repositories.artifacts.listStorageLocators()).toContain(diff.storageLocator);
+    expect(
+      await repositories.artifacts.getForProject(fixture.run.id, fixture.project.id, stdout.id),
+    ).toEqual(stdout);
+    await expect(
+      repositories.artifacts.getForProject(fixture.run.id, randomUUID(), diffId),
+    ).rejects.toThrow("not found");
+    await expect(
+      repositories.artifacts.create({
+        runId: fixture.run.id,
+        projectId: randomUUID(),
+        type: "stdout",
+        logicalName: "wrong-project.txt",
+        contentType: "text/plain",
+        byteSize: 0,
+        sha256: null,
+        storageLocator: null,
+        collectionStatus: "unavailable",
+        collectionError: "Unavailable",
+      }),
+    ).rejects.toThrow("must belong to its project");
+    await expect(
+      repositories.artifacts.create(
+        {
+          runId: fixture.run.id,
+          projectId: fixture.project.id,
+          type: "git_diff",
+          logicalName: "patch.diff",
+          contentType: "text/x-diff",
+          byteSize: 1,
+          sha256: "b".repeat(64),
+          storageLocator: `${diffId.slice(0, 2)}/${diffId}.artifact`,
+          collectionStatus: "complete",
+          collectionError: null,
+        },
+        diffId,
+      ),
+    ).rejects.toBeInstanceOf(RepositoryConflictError);
   });
 
   it("stores normalized events in order, redacts secrets, and filters by sequence", async () => {
@@ -234,9 +450,12 @@ describe(`PostgreSQL persistence (${testMode})`, () => {
       resolvedAt: null,
       resolvedBy: null,
     });
+    await expect(
+      repositories.approvals.resolve(approval.id, "approved", "human:operator"),
+    ).rejects.toThrow(/trusted server-side policy service/);
     expect(
-      (await repositories.approvals.resolve(approval.id, "approved", "human:operator")).status,
-    ).toBe("approved");
+      (await repositories.approvals.resolve(approval.id, "rejected", "human:operator")).status,
+    ).toBe("rejected");
     await expect(
       repositories.approvals.resolve(approval.id, "rejected", "human:operator"),
     ).rejects.toBeInstanceOf(RepositoryConflictError);
@@ -252,6 +471,155 @@ describe(`PostgreSQL persistence (${testMode})`, () => {
     expect(
       (await repositories.runs.list({ projectId: fixture.project.id, limit: 1 })).items,
     ).toHaveLength(1);
+  });
+
+  it("atomically consumes a principal/action/run-bound approval only once", async () => {
+    const fixture = await createFixture();
+    const principalId = "pg-user-1";
+    const approval = await repositories.approvals.create({
+      runId: fixture.run.id,
+      actionType: "workspace.write",
+      actionDescription: "Write to this run workspace",
+      requestedPermissions: ["file.write"],
+      status: "approved",
+      requestedAt: fixedTime,
+      resolvedAt: fixedTime,
+      resolvedBy: principalId,
+      principalId,
+      policyVersion: "policy-v1",
+      expiresAt: "2026-11-05T13:00:00.000Z",
+    });
+    const input = {
+      id: approval.id,
+      runId: fixture.run.id,
+      principalId,
+      actionType: "workspace.write",
+      policyVersion: "policy-v1",
+      at: fixedTime,
+    };
+    const consume = (value: typeof input) =>
+      repositories.approvals.consumeWithEvent(value, {
+        runId: fixture.run.id,
+        type: "approval.consumed",
+        occurredAt: fixedTime,
+        data: {
+          approvalId: approval.id,
+          principalId: value.principalId,
+          policyVersion: value.policyVersion,
+          actionType: value.actionType,
+        },
+      });
+    const results = await Promise.allSettled([consume(input), consume(input)]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect((await repositories.approvals.getById(approval.id)).consumedAt).toBe(fixedTime);
+    await expect(consume({ ...input, principalId: "wrong-principal" })).rejects.toBeInstanceOf(
+      RepositoryConflictError,
+    );
+  });
+
+  it("rolls approval consumption back if PostgreSQL cannot persist its audit event", async () => {
+    const fixture = await createFixture();
+    const principalId = "pg-audit-failure-user";
+    const approval = await repositories.approvals.create({
+      runId: fixture.run.id,
+      actionType: "workspace.write",
+      actionDescription: "Permit writes",
+      requestedPermissions: ["file.write"],
+      status: "approved",
+      requestedAt: fixedTime,
+      resolvedAt: fixedTime,
+      resolvedBy: principalId,
+      principalId,
+      policyVersion: "policy-v1",
+      expiresAt: "2026-11-05T13:00:00.000Z",
+    });
+    await database.pool.query(`
+      CREATE FUNCTION reject_approval_consumption_audit() RETURNS trigger
+      LANGUAGE plpgsql AS $$ BEGIN
+        IF NEW.type = 'approval.consumed' THEN
+          RAISE EXCEPTION 'audit storage unavailable';
+        END IF;
+        RETURN NEW;
+      END $$;
+      CREATE TRIGGER reject_approval_consumption_audit
+      BEFORE INSERT ON agent_events
+      FOR EACH ROW EXECUTE FUNCTION reject_approval_consumption_audit();
+    `);
+    await expect(
+      repositories.approvals.consumeWithEvent(
+        {
+          id: approval.id,
+          runId: fixture.run.id,
+          principalId,
+          actionType: "workspace.write",
+          policyVersion: "policy-v1",
+          at: fixedTime,
+        },
+        {
+          runId: fixture.run.id,
+          type: "approval.consumed",
+          occurredAt: fixedTime,
+          data: {
+            approvalId: approval.id,
+            principalId,
+            policyVersion: "policy-v1",
+            actionType: "workspace.write",
+          },
+        },
+      ),
+    ).rejects.toThrow();
+    expect((await repositories.approvals.getById(approval.id)).consumedAt).toBeNull();
+    expect(
+      (await repositories.events.list({ runId: fixture.run.id })).items.filter(
+        (event) => event.type === "approval.consumed",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("serializes revocation racing with consumption so only one terminal action wins", async () => {
+    const fixture = await createFixture();
+    const principalId = "pg-race-user";
+    const approval = await repositories.approvals.create({
+      runId: fixture.run.id,
+      actionType: "workspace.write",
+      actionDescription: "Permit writes",
+      requestedPermissions: ["file.write"],
+      status: "approved",
+      requestedAt: fixedTime,
+      resolvedAt: fixedTime,
+      resolvedBy: principalId,
+      principalId,
+      policyVersion: "policy-v1",
+      expiresAt: "2026-11-05T13:00:00.000Z",
+    });
+    const input = {
+      id: approval.id,
+      runId: fixture.run.id,
+      principalId,
+      actionType: "workspace.write",
+      policyVersion: "policy-v1",
+      at: fixedTime,
+    };
+    const [consumed, revoked] = await Promise.allSettled([
+      repositories.approvals.consumeWithEvent(input, {
+        runId: fixture.run.id,
+        type: "approval.consumed",
+        occurredAt: fixedTime,
+        data: {
+          approvalId: approval.id,
+          principalId,
+          policyVersion: "policy-v1",
+          actionType: "workspace.write",
+        },
+      }),
+      repositories.approvals.revoke(approval.id, principalId, fixedTime),
+    ]);
+    expect(
+      [consumed.status, revoked.status].filter((status) => status === "fulfilled"),
+    ).toHaveLength(1);
+    const stored = await repositories.approvals.getById(approval.id);
+    expect(Number(stored.consumedAt !== null) + Number(stored.revokedAt !== null)).toBe(1);
   });
 
   it("enforces foreign keys and maps unique violations to repository errors", async () => {

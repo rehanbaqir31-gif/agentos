@@ -1,0 +1,28 @@
+{
+  "name": "@agentos/agents",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check-types": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src test",
+    "test": "vitest run",
+    "test:docker": "node test/run-docker-integration.mjs"
+  },
+  "dependencies": {
+    "@agentos/core": "workspace:*",
+    "@agentos/database": "workspace:*",
+    "@opencode-ai/sdk": "^1.19.5",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5"
+  }
+}
