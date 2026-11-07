@@ -14,6 +14,7 @@ const runId = randomUUID();
 const image = process.env.AGENTOS_DOCKER_TEST_IMAGE ?? "";
 const parent = join(tmpdir(), `agentos-docker-real-${process.pid}`);
 const repository = join(parent, "repo");
+const hostCanary = join(parent, "host-only-canary.txt");
 const containerIds: string[] = [];
 const runtime = enabled ? new DockerIsolatedRuntime({ image }) : undefined;
 
@@ -42,6 +43,7 @@ suite("Docker runtime against a real daemon", () => {
     if (!image) throw new Error("AGENTOS_DOCKER_TEST_IMAGE must be set to a built image ID");
     console.info(`Docker daemon: ${await docker("version", "--format", "{{.Server.Version}}")}`);
     await mkdir(repository, { recursive: true });
+    await writeFile(hostCanary, `host-only-${runId}`);
     const git = (...args: string[]) =>
       execFile("git", args, { cwd: repository, windowsHide: true });
     await git("init", "--quiet");
@@ -137,6 +139,7 @@ suite("Docker runtime against a real daemon", () => {
       await expect(
         docker("exec", id, "sh", "-c", "touch /workspace/forbidden /etc/forbidden"),
       ).rejects.toThrow();
+      await expect(docker("exec", id, "cat", hostCanary)).rejects.toThrow();
       await expect(
         docker(
           "exec",
