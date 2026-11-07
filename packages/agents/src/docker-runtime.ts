@@ -37,14 +37,20 @@ export interface DockerRuntimeOptions {
   commandRunner?: DockerCommandRunner;
   gitRunner?: GitCommandRunner;
   readinessTimeoutMs?: number;
-  healthProbe?: (url: string, authorization: string) => Promise<boolean>;
+  healthProbe?: (
+    url: string,
+    authorization: string,
+  ) => Promise<{ healthy: boolean; version: string | null }>;
 }
 
 export class DockerIsolatedRuntime implements IsolatedRuntime {
   private readonly image: string;
   private readonly docker: DockerCommandRunner;
   private readonly readinessTimeoutMs: number;
-  private readonly healthProbe: (url: string, authorization: string) => Promise<boolean>;
+  private readonly healthProbe: (
+    url: string,
+    authorization: string,
+  ) => Promise<{ healthy: boolean; version: string | null }>;
   private readonly workspaces: GitWorkspaceManager;
 
   constructor(options: DockerRuntimeOptions) {
@@ -53,6 +59,30 @@ export class DockerIsolatedRuntime implements IsolatedRuntime {
     this.workspaces = new GitWorkspaceManager(options.gitRunner);
     this.readinessTimeoutMs = options.readinessTimeoutMs ?? 30_000;
     this.healthProbe = options.healthProbe ?? defaultHealthProbe;
+  }
+
+  async detect(): Promise<{ installed: boolean; version: string | null }> {
+    try {
+      const output = await this.docker.run(
+        [
+          "run",
+          "--rm",
+          "--network=none",
+          "--read-only",
+          "--user=10001:10001",
+          "--cap-drop=ALL",
+          "--security-opt=no-new-privileges:true",
+          this.image,
+          "opencode",
+          "--version",
+        ],
+        { timeoutMs: 15_000 },
+      );
+      const version = output.match(/(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)/)?.[1] ?? null;
+      return { installed: version !== null, version };
+    } catch {
+      return { installed: false, version: null };
+    }
   }
 
   async allocate(config: AdapterConfig, runId: string): Promise<RuntimeAllocation> {
@@ -111,9 +141,12 @@ export class DockerIsolatedRuntime implements IsolatedRuntime {
       const serverUrl = `http://127.0.0.1:${match[1]}`;
       const deadline = Date.now() + this.readinessTimeoutMs;
       let healthy = false;
+      let adapterVersion = "";
       while (Date.now() < deadline) {
         try {
-          if (await this.healthProbe(serverUrl, authorizationHeader)) {
+          const result = await this.healthProbe(serverUrl, authorizationHeader);
+          if (result.healthy && result.version) {
+            adapterVersion = result.version;
             healthy = true;
             break;
           }
@@ -127,6 +160,16 @@ export class DockerIsolatedRuntime implements IsolatedRuntime {
       let stopped = false;
       return {
         workspacePath: workspace.path,
+        baseCommit: workspace.baseCommit,
+        adapterVersion,
+        runtimeConfiguration: {
+          isolationMode: "docker",
+          networkAccess: "disabled",
+          timeoutSeconds: config.timeoutSeconds,
+          memoryLimitMb: 2048,
+          cpuLimit: 2,
+          networkAllowlist: [],
+        },
         serverUrl,
         authorizationHeader,
         cancel: async () => {
@@ -142,6 +185,9 @@ export class DockerIsolatedRuntime implements IsolatedRuntime {
             summary: `${result.changedFiles.length} changed files`,
             changedFiles: result.changedFiles.map((item) => item.path),
             diff: result.diff,
+            fileHashes: Object.fromEntries(
+              result.changedFiles.map((item) => [item.path, item.sha256]),
+            ),
           };
         },
         dispose: async () => {
@@ -176,12 +222,21 @@ function isMissingContainer(error: unknown): boolean {
   return /no such container|no such object/i.test(message);
 }
 
-async function defaultHealthProbe(url: string, authorization: string): Promise<boolean> {
+async function defaultHealthProbe(
+  url: string,
+  authorization: string,
+): Promise<{ healthy: boolean; version: string | null }> {
   const response = await fetch(new URL("/global/health", url), {
     headers: { authorization },
     signal: AbortSignal.timeout(1_000),
   });
-  if (!response.ok) return false;
+  if (!response.ok) return { healthy: false, version: null };
   const body: unknown = await response.json();
-  return typeof body === "object" && body !== null && "healthy" in body && body.healthy === true;
+  if (typeof body !== "object" || body === null || !("healthy" in body) || body.healthy !== true)
+    return { healthy: false, version: null };
+  const version =
+    "version" in body && typeof body.version === "string"
+      ? (body.version.match(/\d+\.\d+\.\d+/)?.[0] ?? null)
+      : null;
+  return { healthy: true, version };
 }

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { RunManifest } from "@agentos/core";
 
 export const agentCapabilitiesSchema = z
   .object({
@@ -41,14 +42,19 @@ export interface AgentSession {
   id: string;
   runId: string;
   createdAt: string;
+  adapterVersion: string;
+  baseCommit: string;
+  workspacePath: string;
+  runtimeConfiguration: RunManifest["runtimeConfiguration"];
 }
 export interface AgentResult {
   status: "succeeded" | "failed" | "cancelled";
   summary: string | null;
   changedFiles: string[];
   diff: string | null;
+  fileHashes: Record<string, string | null>;
 }
-export type NormalizedAgentEvent =
+export type NormalizedAgentEvent = (
   | {
       type:
         | "session.created"
@@ -83,7 +89,8 @@ export type NormalizedAgentEvent =
       permissionId: string;
       action: string;
       resources: string[];
-    };
+    }
+) & { sourceEventId?: string };
 
 export interface AgentAdapter {
   readonly id: string;
@@ -106,19 +113,30 @@ export interface AgentAdapter {
     config: AdapterConfig,
     session: AgentSession,
     signal: AbortSignal,
+    onReady: () => void,
   ): AsyncIterable<NormalizedAgentEvent>;
   cancel(config: AdapterConfig, session: AgentSession): Promise<void>;
   status(config: AdapterConfig, session: AgentSession): Promise<unknown>;
   collectResults(config: AdapterConfig, session: AgentSession): Promise<AgentResult>;
+  respondPermission(
+    config: AdapterConfig,
+    session: AgentSession,
+    permissionId: string,
+    approved: false,
+  ): Promise<void>;
   dispose(): Promise<void>;
 }
 
 export interface IsolatedRuntime {
   /** Must create a run-scoped OS sandbox; this is never optional during execution. */
   allocate(config: AdapterConfig, runId: string): Promise<RuntimeAllocation>;
+  detect?(): Promise<{ installed: boolean; version: string | null }>;
 }
 export interface RuntimeAllocation {
   workspacePath: string;
+  baseCommit: string;
+  adapterVersion: string;
+  runtimeConfiguration: RunManifest["runtimeConfiguration"];
   serverUrl: string;
   authorizationHeader: string;
   cancel(): Promise<void>;

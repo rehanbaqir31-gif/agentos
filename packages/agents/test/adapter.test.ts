@@ -12,6 +12,16 @@ const config = adapterConfigSchema.parse({
 const runtime = {
   allocate: vi.fn(async () => ({
     workspacePath: "C:\\runs\\1",
+    baseCommit: "a".repeat(40),
+    adapterVersion: "1.2.0",
+    runtimeConfiguration: {
+      isolationMode: "docker" as const,
+      networkAccess: "disabled" as const,
+      timeoutSeconds: 3600,
+      memoryLimitMb: 2048,
+      cpuLimit: 2,
+      networkAllowlist: [],
+    },
     serverUrl: "http://127.0.0.1:4096",
     authorizationHeader: "Basic dGVzdA==",
     cancel: vi.fn(async () => undefined),
@@ -20,6 +30,7 @@ const runtime = {
       summary: null,
       changedFiles: [],
       diff: null,
+      fileHashes: {},
     })),
     dispose: vi.fn(async () => undefined),
   })),
@@ -143,6 +154,16 @@ describe("OpenCode adapter", () => {
       {
         allocate: async () => ({
           workspacePath: "C:\\runs\\1",
+          baseCommit: "a".repeat(40),
+          adapterVersion: "1.2.0",
+          runtimeConfiguration: {
+            isolationMode: "docker",
+            networkAccess: "disabled",
+            timeoutSeconds: 3600,
+            memoryLimitMb: 2048,
+            cpuLimit: 2,
+            networkAllowlist: [],
+          },
           serverUrl: `http://127.0.0.1:${address.port}`,
           authorizationHeader: "Basic dGVzdA==",
           cancel: async () => undefined,
@@ -151,6 +172,7 @@ describe("OpenCode adapter", () => {
             summary: null,
             changedFiles: [],
             diff: null,
+            fileHashes: {},
           }),
           dispose: async () => undefined,
         }),

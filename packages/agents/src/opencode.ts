@@ -39,9 +39,10 @@ export function normalizeOpenCodeEvent(
   at = new Date().toISOString(),
 ): NormalizedAgentEvent | null {
   if (typeof raw !== "object" || raw === null) return null;
-  const event = raw as { type?: unknown; properties?: Record<string, unknown> };
+  const event = raw as { id?: unknown; type?: unknown; properties?: Record<string, unknown> };
   const p = event.properties;
   if (typeof event.type !== "string" || !p) return null;
+  const sourceEvent = typeof event.id === "string" ? { sourceEventId: event.id } : {};
   const sessionId = typeof p["sessionID"] === "string" ? p["sessionID"] : "";
   const callId = typeof p["callID"] === "string" ? p["callID"] : undefined;
   const tool = typeof p["tool"] === "string" ? p["tool"] : "unknown";
@@ -67,17 +68,32 @@ export function normalizeOpenCodeEvent(
         | "run.failed",
       sessionId,
       at,
+      ...sourceEvent,
     };
   if (
     (event.type === "session.next.tool.called" || event.type === "session.tool.called") &&
     sessionId
   )
-    return { type: "tool.started", sessionId, at, tool, ...(callId ? { callId } : {}) };
+    return {
+      type: "tool.started",
+      sessionId,
+      at,
+      tool,
+      ...(callId ? { callId } : {}),
+      ...sourceEvent,
+    };
   if (
     (event.type === "session.next.tool.success" || event.type === "session.tool.success") &&
     sessionId
   )
-    return { type: "tool.completed", sessionId, at, tool, ...(callId ? { callId } : {}) };
+    return {
+      type: "tool.completed",
+      sessionId,
+      at,
+      tool,
+      ...(callId ? { callId } : {}),
+      ...sourceEvent,
+    };
   if (event.type === "session.next.tool.failed" && sessionId)
     return {
       type: "tool.failed",
@@ -86,9 +102,10 @@ export function normalizeOpenCodeEvent(
       tool,
       ...(callId ? { callId } : {}),
       error: "OpenCode tool failed",
+      ...sourceEvent,
     };
   if (event.type === "file.edited" && typeof p["file"] === "string")
-    return { type: "file.changed", sessionId, at, path: p["file"] };
+    return { type: "file.changed", sessionId, at, path: p["file"], ...sourceEvent };
   if (
     (event.type === "permission.v2.asked" || event.type === "permission.asked") &&
     sessionId &&
@@ -112,6 +129,7 @@ export function normalizeOpenCodeEvent(
       permissionId: p["id"],
       action,
       resources,
+      ...sourceEvent,
     };
   }
   return null;
@@ -150,9 +168,12 @@ export class OpenCodeAdapter implements AgentAdapter {
   async detect(
     config: AdapterConfig,
   ): Promise<{ installed: boolean; version: string | null; reason?: string }> {
-    const version = await this.probe.version(config.executablePath ?? "opencode");
+    const detected = this.runtime?.detect
+      ? await this.runtime.detect()
+      : { installed: true, version: await this.probe.version(config.executablePath ?? "opencode") };
+    const version = detected.version;
     return {
-      installed: version !== null && supported(version),
+      installed: detected.installed && version !== null && supported(version),
       version,
       ...(version && !supported(version)
         ? { reason: "Unsupported OpenCode version; supported versions are >=1.1.1 and <2.0.0" }
@@ -194,6 +215,8 @@ export class OpenCodeAdapter implements AgentAdapter {
         isolated.workspacePath.toLocaleLowerCase() === config.projectDirectory.toLocaleLowerCase()
       )
         throw new Error("Isolated workspace cannot be the source repository");
+      if (!supported(isolated.adapterVersion))
+        throw new Error("Docker image contains an unsupported OpenCode version");
       const client = this.makeClient({
         baseUrl: isolated.serverUrl,
         directory: isolated.workspacePath,
@@ -218,7 +241,16 @@ export class OpenCodeAdapter implements AgentAdapter {
       const id = created.data?.id;
       if (!id) throw new Error("OpenCode returned no session identifier");
       this.sessions.set(runId, id);
-      return { id, runId, createdAt: new Date().toISOString() };
+      const allocation = this.runtimes.get(runId)!;
+      return {
+        id,
+        runId,
+        createdAt: new Date().toISOString(),
+        adapterVersion: allocation.adapterVersion,
+        baseCommit: allocation.baseCommit,
+        workspacePath: allocation.workspacePath,
+        runtimeConfiguration: allocation.runtimeConfiguration,
+      };
     } catch (error) {
       const runtime = this.runtimes.get(runId);
       this.runtimes.delete(runId);
@@ -240,7 +272,16 @@ export class OpenCodeAdapter implements AgentAdapter {
     });
     if (!existing.data?.id) throw new Error("OpenCode session was not found");
     this.sessions.set(runId, sessionId);
-    return { id: sessionId, runId, createdAt: new Date().toISOString() };
+    const allocation = this.runtimes.get(runId)!;
+    return {
+      id: sessionId,
+      runId,
+      createdAt: new Date().toISOString(),
+      adapterVersion: allocation.adapterVersion,
+      baseCommit: allocation.baseCommit,
+      workspacePath: allocation.workspacePath,
+      runtimeConfiguration: allocation.runtimeConfiguration,
+    };
   }
   async execute(
     config: AdapterConfig,
@@ -273,19 +314,23 @@ export class OpenCodeAdapter implements AgentAdapter {
       summary: info?.time?.completed ? "OpenCode session completed" : null,
       changedFiles: [],
       diff: null,
+      fileHashes: {},
     };
   }
   async *stream(
     config: AdapterConfig,
     session: AgentSession,
     signal: AbortSignal,
+    onReady: () => void,
   ): AsyncIterable<NormalizedAgentEvent> {
     const c = await this.connect(config, session.runId);
     const result = await c.event.subscribe({ signal });
+    onReady();
     for await (const raw of result.stream) {
       if (signal.aborted) break;
       const normalized = normalizeOpenCodeEvent(raw);
-      if (normalized) yield normalized;
+      if (normalized)
+        yield normalized.sessionId ? normalized : { ...normalized, sessionId: session.id };
       // Reasoning and text deltas are deliberately discarded to keep private chain-of-thought out of AgentOS events.
     }
   }
@@ -293,6 +338,22 @@ export class OpenCodeAdapter implements AgentAdapter {
     const c = await this.connect(config, session.runId);
     await c.session.abort({ path: { id: session.id }, throwOnError: true });
     await this.runtimes.get(session.runId)?.cancel();
+  }
+  async respondPermission(
+    config: AdapterConfig,
+    session: AgentSession,
+    permissionId: string,
+    approved: false,
+  ): Promise<void> {
+    if (approved !== false)
+      throw new Error("This adapter path only supports policy-denied permissions");
+    const c = await this.connect(config, session.runId);
+    await c.postSessionIdPermissionsPermissionId({
+      path: { id: session.id, permissionID: permissionId },
+      query: { directory: this.runtimes.get(session.runId)!.workspacePath },
+      body: { response: "reject" },
+      throwOnError: true,
+    });
   }
   async status(config: AdapterConfig, session: AgentSession): Promise<unknown> {
     const c = await this.connect(config, session.runId);

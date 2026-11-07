@@ -40,7 +40,7 @@ describe("Docker isolated runtime", () => {
       const runtime = new DockerIsolatedRuntime({
         image,
         commandRunner: docker,
-        healthProbe: async () => true,
+        healthProbe: async () => ({ healthy: true, version: "1.2.0" }),
       });
       const config = adapterConfigSchema.parse({
         projectDirectory: f.repository,
@@ -86,7 +86,7 @@ describe("Docker isolated runtime", () => {
     const runtime = new DockerIsolatedRuntime({
       image,
       commandRunner: docker,
-      healthProbe: async () => true,
+      healthProbe: async () => ({ healthy: true, version: "1.2.0" }),
     });
     await expect(
       runtime.allocate(
@@ -123,7 +123,7 @@ describe("Docker isolated runtime", () => {
       const runtime = new DockerIsolatedRuntime({
         image,
         commandRunner: docker,
-        healthProbe: async () => false,
+        healthProbe: async () => ({ healthy: false, version: null }),
         readinessTimeoutMs: 1,
       });
       const config = adapterConfigSchema.parse({

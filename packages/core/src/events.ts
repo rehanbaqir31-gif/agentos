@@ -28,6 +28,48 @@ export const agentEventSchema = z.discriminatedUnion("type", [
   z
     .object({
       ...base,
+      type: z.literal("session.attached"),
+      data: z.object({ sessionId: z.string().min(1).max(256) }).strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...base,
+      type: z.literal("file.changed"),
+      data: z.object({ path: z.string().min(1).max(4096) }).strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...base,
+      type: z.literal("run.result"),
+      data: z
+        .object({
+          summary: z.string().max(20_000).nullable(),
+          diffSha256: z
+            .string()
+            .regex(/^[a-f0-9]{64}$/i)
+            .nullable(),
+          files: z
+            .array(
+              z
+                .object({
+                  path: z.string().min(1).max(4096),
+                  sha256: z
+                    .string()
+                    .regex(/^[a-f0-9]{64}$/i)
+                    .nullable(),
+                })
+                .strict(),
+            )
+            .max(10_000),
+        })
+        .strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...base,
       type: z.literal("run.failed"),
       data: z
         .object({ code: z.string().max(128).nullable(), message: z.string().max(20_000) })
@@ -169,9 +211,7 @@ export const agentEventSchema = z.discriminatedUnion("type", [
 ]);
 
 export type AgentEvent = z.infer<typeof agentEventSchema>;
-type WithoutEventMetadata<T> = T extends { id: string; sequence: number }
-  ? Omit<T, "id" | "sequence">
-  : never;
+type WithoutEventMetadata<T> = T extends unknown ? Omit<T, "id" | "sequence"> : never;
 export type CreateAgentEvent = WithoutEventMetadata<AgentEvent>;
 export const createAgentEventSchema: z.ZodType<CreateAgentEvent> = z.custom<CreateAgentEvent>(
   (value) => {
