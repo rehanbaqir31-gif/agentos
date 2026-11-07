@@ -22,12 +22,15 @@ Threats include prompt injection, path traversal, unauthorized shell/network acc
 - Provider errors are normalized without forwarding provider response bodies, request URLs, or credentials. Custom HTTP headers reject authentication/secret header names and secret-like values; authentication headers use a credential reference.
 - Persist run/event state and validate transitions; cancellation and cleanup must be safe and idempotent.
 - Validate adapter and provider configuration at boundaries; declare only verified capabilities.
+- OpenCode's application permission prompts are not an OS security boundary. An AgentOS-managed isolated runtime must enforce filesystem, process, network, and resource boundaries before any task runs. Without that runtime, fail closed; a Git worktree alone is not isolation.
 
 ## Assumptions and limitations
 
 Local single-user mode trusts the host account and operating system. Docker is defense in depth, not a complete isolation boundary; host kernel, daemon, image supply chain, and configuration remain in the trusted computing base. Sandbox guarantees must be documented per supported platform before autonomous execution is offered. The current environment has no Docker or Rust/Cargo, so container and Tauri verification are unavailable.
 
 SQLite is the default local database and PostgreSQL is supported for servers. PostgreSQL 16 migrations and integration tests pass in CI. Provider connections are direct outbound HTTP requests from the host process; they do not yet enforce an egress allowlist or network sandbox. Configure trusted endpoints and restrict network access at the host/firewall layer.
+
+The OpenCode SDK adapter currently supports installation/version probing, loopback health checks, session creation/resume, prompt submission, event streaming, abort, and local session-handle release. It requires an injected runtime and advertises isolation unavailable unless one is supplied. No concrete runtime exists yet; sandboxing, permissions, durable run/session association, and Git result collection have not been verified. OpenCode's `DELETE session` endpoint is intentionally not used because it destroys durable session history.
 
 ## Verification plan
 

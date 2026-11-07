@@ -14,6 +14,8 @@ clients (web / CLI / desktop) -> versioned API -> application services
 
 The workspace includes `@agentos/core` (Zod domain/event contracts, run lifecycle and common repository contracts), `@agentos/database` (Drizzle schemas and SQLite/PostgreSQL repositories), and `@agentos/providers` (validated provider drivers, normalized requests/responses, credential references and registry). Runtime packages should be introduced when their contracts and behavior are implemented; do not create empty placeholder integrations.
 
+The new `@agentos/agents` package defines the adapter contract and registry and a first OpenCode adapter using `@opencode-ai/sdk`. It is currently an adapter layer only: no AgentOS execution coordinator, durable session/run wiring, Git worktree manager, or sandbox runtime is implemented yet. Keep provider setup distinct: an AgentOS provider record does not configure an OpenCode-owned model provider.
+
 ## Runtime boundaries
 
 - **Core:** identifiers, validated domain types, run lifecycle rules, event contracts, and capability vocabulary.
@@ -27,6 +29,8 @@ The workspace includes `@agentos/core` (Zod domain/event contracts, run lifecycl
 ## Execution and trust
 
 Each run receives a unique ID, a dedicated workspace, a versioned manifest without secrets, and a durable event stream. State changes are validated and persisted. Treat prompts, adapters, MCP servers, model output, and repository contents as untrusted. A container is defense in depth, not a complete host/kernel security boundary. Network access is disabled by default where practical; resource limits and cleanup are mandatory.
+
+OpenCode execution is gated by an injected `IsolatedRuntime`; without it, adapter session initialization fails closed. The adapter requires its runtime-returned workspace to differ from the source directory and its server to use loopback. These interface checks do not prove OS isolation. There is no shipped runtime implementation yet, so task execution is unavailable.
 
 ## Deployment progression
 
