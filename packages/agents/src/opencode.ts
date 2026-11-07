@@ -11,6 +11,7 @@ import {
   type IsolatedRuntime,
   type NormalizedAgentEvent,
 } from "./contracts.js";
+import { redactEventSecrets } from "@agentos/core";
 
 export interface ProcessProbe {
   version(executable: string): Promise<string | null>;
@@ -138,6 +139,27 @@ function supported(version: string | null): boolean {
   if (!version) return false;
   const [major, minor, patch] = version.split(".").map(Number);
   return major === 1 && ((minor ?? 0) > 1 || ((minor ?? 0) === 1 && (patch ?? 0) >= 1));
+}
+
+/** Extract only user-facing text parts from the SDK's completed assistant response. */
+export function extractOpenCodeFinalText(parts: unknown): string | null {
+  if (!Array.isArray(parts)) return null;
+  const text = parts
+    .filter(
+      (part): part is { type: "text"; text: string; synthetic?: boolean; ignored?: boolean } =>
+        typeof part === "object" &&
+        part !== null &&
+        "type" in part &&
+        part.type === "text" &&
+        "text" in part &&
+        typeof part.text === "string" &&
+        !("synthetic" in part && part.synthetic === true) &&
+        !("ignored" in part && part.ignored === true),
+    )
+    .map((part) => part.text.trim())
+    .filter(Boolean)
+    .join("\n\n");
+  return text ? redactEventSecrets(text).slice(0, 20_000) : null;
 }
 
 export class OpenCodeAdapter implements AgentAdapter {
@@ -320,7 +342,7 @@ export class OpenCodeAdapter implements AgentAdapter {
     const info = response.data?.info as { time?: { completed?: number } } | undefined;
     return {
       status: "succeeded",
-      summary: info?.time?.completed ? "OpenCode session completed" : null,
+      summary: info?.time?.completed ? extractOpenCodeFinalText(response.data?.parts) : null,
       changedFiles: [],
       diff: null,
       fileHashes: {},

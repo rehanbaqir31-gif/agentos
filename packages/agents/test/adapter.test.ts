@@ -2,7 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 import { createServer } from "node:http";
 import type { OpencodeClient } from "@opencode-ai/sdk";
 import { adapterConfigSchema } from "../src/contracts.js";
-import { normalizeOpenCodeEvent, OpenCodeAdapter, parseOpenCodeVersion } from "../src/opencode.js";
+import {
+  extractOpenCodeFinalText,
+  normalizeOpenCodeEvent,
+  OpenCodeAdapter,
+  parseOpenCodeVersion,
+} from "../src/opencode.js";
 import { AdapterRegistry } from "../src/registry.js";
 
 const config = adapterConfigSchema.parse({
@@ -87,6 +92,18 @@ describe("OpenCode adapter", () => {
     ).toBeNull();
   });
 
+  it("captures only user-facing final text and redacts common secrets", () => {
+    expect(
+      extractOpenCodeFinalText([
+        { type: "reasoning", text: "private thought" },
+        { type: "text", text: "README describes the project. sk-abcdefghijklmnop1234" },
+        { type: "text", text: "ignored", ignored: true },
+        { type: "text", text: "synthetic", synthetic: true },
+      ]),
+    ).toBe("README describes the project. [REDACTED]");
+    expect(extractOpenCodeFinalText(undefined)).toBeNull();
+  });
+
   it("keeps execution unavailable when no isolation runtime is supplied", async () => {
     const adapter = new OpenCodeAdapter(undefined, { version: async () => "1.2.0" });
     expect(adapter.capabilities().isolatedExecution).toBe(false);
@@ -99,7 +116,15 @@ describe("OpenCode adapter", () => {
     const sdk = {
       session: {
         create: vi.fn(async () => ({ data: { id: "session-a" } })),
-        prompt: vi.fn(async () => ({ data: { info: { time: { completed: 1 } } } })),
+        prompt: vi.fn(async () => ({
+          data: {
+            info: { time: { completed: 1 } },
+            parts: [
+              { type: "reasoning", text: "private reasoning" },
+              { type: "text", text: "The README explains the repository." },
+            ],
+          },
+        })),
       },
     } as unknown as OpencodeClient;
     const adapter = new OpenCodeAdapter(runtime, { version: async () => "1.2.0" }, () => sdk);
@@ -115,6 +140,9 @@ describe("OpenCode adapter", () => {
       new AbortController().signal,
     );
     expect(result.status).toBe("succeeded");
+    expect(result.summary).toBe("The README explains the repository.");
+    expect(result.stdout).toBeUndefined();
+    expect(result.stderr).toBeUndefined();
     expect(sdk.session.prompt).toHaveBeenCalledWith(
       expect.objectContaining({ query: { directory: "C:\\runs\\1" } }),
     );
