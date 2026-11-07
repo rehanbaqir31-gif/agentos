@@ -669,37 +669,73 @@ export class ApprovalRepository {
       throw new RepositoryConflictError("Approval has already been resolved");
     return this.getById(id);
   }
-  consume(input: {
-    id: string;
-    runId: string;
-    principalId: string;
-    actionType: string;
-    policyVersion: string;
-    at: string;
-  }): Approval {
-    const result = this.database.orm
-      .update(approvals)
-      .set({ consumedAt: input.at })
-      .where(
-        and(
-          eq(approvals.id, assertId(input.id)),
-          eq(approvals.runId, assertId(input.runId)),
-          eq(approvals.principalId, input.principalId),
-          eq(approvals.resolvedBy, input.principalId),
-          eq(approvals.actionType, input.actionType),
-          eq(approvals.policyVersion, input.policyVersion),
-          eq(approvals.status, "approved"),
-          gt(approvals.expiresAt, input.at),
-          isNull(approvals.consumedAt),
-          isNull(approvals.revokedAt),
-        ),
-      )
-      .run();
-    if (result.changes === 0)
-      throw new RepositoryConflictError(
-        "Approval is invalid, expired, revoked, or already consumed",
-      );
-    return this.getById(input.id);
+  consumeWithEvent(
+    input: {
+      id: string;
+      runId: string;
+      principalId: string;
+      actionType: string;
+      policyVersion: string;
+      at: string;
+    },
+    event: Extract<CreateAgentEvent, { type: "approval.consumed" }>,
+    isCancelled?: () => boolean,
+  ): Approval {
+    const base = createAgentEventSchema.parse(redactEventSecrets(event));
+    if (
+      base.type !== "approval.consumed" ||
+      base.runId !== input.runId ||
+      base.data.approvalId !== input.id ||
+      base.data.principalId !== input.principalId ||
+      base.data.actionType !== input.actionType ||
+      base.data.policyVersion !== input.policyVersion
+    )
+      throw new RelationshipValidationError("Consumption audit event must match its run");
+    try {
+      return this.database.orm.transaction((tx) => {
+        assertNotCancelled(isCancelled);
+        const updated = tx
+          .update(approvals)
+          .set({ consumedAt: input.at })
+          .where(
+            and(
+              eq(approvals.id, assertId(input.id)),
+              eq(approvals.runId, assertId(input.runId)),
+              eq(approvals.principalId, input.principalId),
+              eq(approvals.resolvedBy, input.principalId),
+              eq(approvals.actionType, input.actionType),
+              eq(approvals.policyVersion, input.policyVersion),
+              eq(approvals.status, "approved"),
+              gt(approvals.expiresAt, input.at),
+              isNull(approvals.consumedAt),
+              isNull(approvals.revokedAt),
+            ),
+          )
+          .returning()
+          .get();
+        if (!updated)
+          throw new RepositoryConflictError(
+            "Approval is invalid, expired, revoked, or already consumed",
+          );
+        assertNotCancelled(isCancelled);
+        const sequence =
+          tx
+            .select({ value: max(agentEvents.sequence) })
+            .from(agentEvents)
+            .where(eq(agentEvents.runId, input.runId))
+            .get()?.value ?? 0;
+        const normalized = agentEventSchema.parse({
+          ...base,
+          id: randomUUID(),
+          sequence: sequence + 1,
+        });
+        tx.insert(agentEvents).values(normalized).run();
+        assertNotCancelled(isCancelled);
+        return approvalSchema.parse(updated);
+      });
+    } catch (error) {
+      return translateError(error);
+    }
   }
   revoke(id: string, principalId: string, at: string): Approval {
     const result = this.database.orm
@@ -719,6 +755,10 @@ export class ApprovalRepository {
       throw new RepositoryConflictError("Approval cannot be revoked by this principal");
     return this.getById(id);
   }
+}
+
+function assertNotCancelled(isCancelled?: () => boolean): void {
+  if (isCancelled?.()) throw new RepositoryConflictError("Authorization was cancelled");
 }
 
 export class EvaluationRepository {

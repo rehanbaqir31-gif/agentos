@@ -71,6 +71,10 @@ import {
   translateError,
 } from "./repository-common.js";
 
+function assertNotCancelled(isCancelled?: () => boolean): void {
+  if (isCancelled?.()) throw new RepositoryConflictError("Authorization was cancelled");
+}
+
 function one<T>(rows: T[], entity: string, id: string): T {
   const row = rows[0];
   if (!row) throw new RepositoryNotFoundError(entity, id);
@@ -763,37 +767,75 @@ export class PostgresApprovalRepository {
     if (!rows.length) throw new RepositoryConflictError("Approval has already been resolved");
     return approvalSchema.parse(normalizeTimestamps(rows[0]));
   }
-  async consume(input: {
-    id: string;
-    runId: string;
-    principalId: string;
-    actionType: string;
-    policyVersion: string;
-    at: string;
-  }): Promise<Approval> {
-    const rows = await this.database.orm
-      .update(pgApprovals)
-      .set({ consumedAt: input.at })
-      .where(
-        and(
-          eq(pgApprovals.id, assertId(input.id)),
-          eq(pgApprovals.runId, assertId(input.runId)),
-          eq(pgApprovals.principalId, input.principalId),
-          eq(pgApprovals.resolvedBy, input.principalId),
-          eq(pgApprovals.actionType, input.actionType),
-          eq(pgApprovals.policyVersion, input.policyVersion),
-          eq(pgApprovals.status, "approved"),
-          gt(pgApprovals.expiresAt, input.at),
-          isNull(pgApprovals.consumedAt),
-          isNull(pgApprovals.revokedAt),
-        ),
-      )
-      .returning();
-    if (!rows.length)
-      throw new RepositoryConflictError(
-        "Approval is invalid, expired, revoked, or already consumed",
-      );
-    return approvalSchema.parse(normalizeTimestamps(rows[0]));
+  async consumeWithEvent(
+    input: {
+      id: string;
+      runId: string;
+      principalId: string;
+      actionType: string;
+      policyVersion: string;
+      at: string;
+    },
+    event: Extract<CreateAgentEvent, { type: "approval.consumed" }>,
+    isCancelled?: () => boolean,
+  ): Promise<Approval> {
+    const base = createAgentEventSchema.parse(redactEventSecrets(event));
+    if (
+      base.type !== "approval.consumed" ||
+      base.runId !== input.runId ||
+      base.data.approvalId !== input.id ||
+      base.data.principalId !== input.principalId ||
+      base.data.actionType !== input.actionType ||
+      base.data.policyVersion !== input.policyVersion
+    )
+      throw new RelationshipValidationError("Consumption audit event must match its run");
+    try {
+      return await this.database.orm.transaction(async (tx) => {
+        assertNotCancelled(isCancelled);
+        const rows = await tx
+          .update(pgApprovals)
+          .set({ consumedAt: input.at })
+          .where(
+            and(
+              eq(pgApprovals.id, assertId(input.id)),
+              eq(pgApprovals.runId, assertId(input.runId)),
+              eq(pgApprovals.principalId, input.principalId),
+              eq(pgApprovals.resolvedBy, input.principalId),
+              eq(pgApprovals.actionType, input.actionType),
+              eq(pgApprovals.policyVersion, input.policyVersion),
+              eq(pgApprovals.status, "approved"),
+              gt(pgApprovals.expiresAt, input.at),
+              isNull(pgApprovals.consumedAt),
+              isNull(pgApprovals.revokedAt),
+            ),
+          )
+          .returning();
+        if (!rows.length)
+          throw new RepositoryConflictError(
+            "Approval is invalid, expired, revoked, or already consumed",
+          );
+        assertNotCancelled(isCancelled);
+        const [counter] = await tx
+          .insert(pgRunEventCounters)
+          .values({ runId: input.runId, lastSequence: 1 })
+          .onConflictDoUpdate({
+            target: pgRunEventCounters.runId,
+            set: { lastSequence: sql`${pgRunEventCounters.lastSequence} + 1` },
+          })
+          .returning({ sequence: pgRunEventCounters.lastSequence });
+        if (!counter) throw new Error("Could not allocate approval event sequence");
+        const value = agentEventSchema.parse({
+          ...base,
+          id: randomUUID(),
+          sequence: counter.sequence,
+        });
+        await tx.insert(pgAgentEvents).values({ ...value, data: value.data });
+        assertNotCancelled(isCancelled);
+        return approvalSchema.parse(normalizeTimestamps(rows[0]));
+      });
+    } catch (error) {
+      return translateError(error);
+    }
   }
   async revoke(id: string, principalId: string, at: string): Promise<Approval> {
     const rows = await this.database.orm

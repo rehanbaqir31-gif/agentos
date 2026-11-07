@@ -325,19 +325,86 @@ describe("SQLite database and repositories", () => {
       policyVersion: "policy-v1",
       at: fixedTime,
     };
+    const consume = (input: typeof consumeInput) =>
+      repositories.approvals.consumeWithEvent(input, {
+        runId: fixture.run.id,
+        type: "approval.consumed",
+        occurredAt: fixedTime,
+        data: {
+          approvalId: approval.id,
+          principalId: input.principalId,
+          policyVersion: input.policyVersion,
+          actionType: input.actionType,
+        },
+      });
     const results = await Promise.allSettled([
-      Promise.resolve().then(() => repositories.approvals.consume(consumeInput)),
-      Promise.resolve().then(() => repositories.approvals.consume(consumeInput)),
+      Promise.resolve().then(() => consume(consumeInput)),
+      Promise.resolve().then(() => consume(consumeInput)),
     ]);
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
     expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
     expect(repositories.approvals.getById(approval.id).consumedAt).toBe(fixedTime);
+    expect(() => consume({ ...consumeInput, principalId: "another-user" })).toThrow(
+      RepositoryConflictError,
+    );
+    expect(() => consume({ ...consumeInput, actionType: "network.access" })).toThrow(
+      RepositoryConflictError,
+    );
+  });
+
+  it("rolls approval consumption back if inserting its audit event fails", async () => {
+    const fixture = await createFixture();
+    const approval = repositories.approvals.create(
+      {
+        runId: fixture.run.id,
+        actionType: "workspace.write",
+        actionDescription: "Permit writes",
+        requestedPermissions: ["file.write"],
+        status: "approved",
+        requestedAt: fixedTime,
+        resolvedAt: fixedTime,
+        resolvedBy: "local-user-1",
+        principalId: "local-user-1",
+        policyVersion: "policy-v1",
+        expiresAt: "2026-11-05T13:00:00.000Z",
+      },
+      randomUUID(),
+    );
+    database.sqlite.exec(`
+      CREATE TRIGGER reject_consumption_audit
+      BEFORE INSERT ON agent_events
+      WHEN NEW.type = 'approval.consumed'
+      BEGIN SELECT RAISE(ABORT, 'audit storage unavailable'); END;
+    `);
     expect(() =>
-      repositories.approvals.consume({ ...consumeInput, principalId: "another-user" }),
-    ).toThrow(RepositoryConflictError);
-    expect(() =>
-      repositories.approvals.consume({ ...consumeInput, actionType: "network.access" }),
-    ).toThrow(RepositoryConflictError);
+      repositories.approvals.consumeWithEvent(
+        {
+          id: approval.id,
+          runId: fixture.run.id,
+          principalId: "local-user-1",
+          actionType: "workspace.write",
+          policyVersion: "policy-v1",
+          at: fixedTime,
+        },
+        {
+          runId: fixture.run.id,
+          type: "approval.consumed",
+          occurredAt: fixedTime,
+          data: {
+            approvalId: approval.id,
+            principalId: "local-user-1",
+            policyVersion: "policy-v1",
+            actionType: "workspace.write",
+          },
+        },
+      ),
+    ).toThrow();
+    expect(repositories.approvals.getById(approval.id).consumedAt).toBeNull();
+    expect(
+      repositories.events
+        .list({ runId: fixture.run.id })
+        .items.filter((event) => event.type === "approval.consumed"),
+    ).toHaveLength(0);
   });
 
   it("rejects expired and revoked approval consumption", async () => {
@@ -360,14 +427,27 @@ describe("SQLite database and repositories", () => {
     const revoked = createGrant("2026-11-05T13:00:00.000Z");
     repositories.approvals.revoke(revoked.id, "local-user-1", fixedTime);
     const consume = (id: string) =>
-      repositories.approvals.consume({
-        id,
-        runId: fixture.run.id,
-        principalId: "local-user-1",
-        actionType: "workspace.write",
-        policyVersion: "policy-v1",
-        at: fixedTime,
-      });
+      repositories.approvals.consumeWithEvent(
+        {
+          id,
+          runId: fixture.run.id,
+          principalId: "local-user-1",
+          actionType: "workspace.write",
+          policyVersion: "policy-v1",
+          at: fixedTime,
+        },
+        {
+          runId: fixture.run.id,
+          type: "approval.consumed",
+          occurredAt: fixedTime,
+          data: {
+            approvalId: id,
+            principalId: "local-user-1",
+            policyVersion: "policy-v1",
+            actionType: "workspace.write",
+          },
+        },
+      );
     expect(() => consume(expired.id)).toThrow(RepositoryConflictError);
     expect(() => consume(revoked.id)).toThrow(RepositoryConflictError);
   });

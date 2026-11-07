@@ -12,15 +12,20 @@ export interface TrustedPrincipalSource {
   currentPrincipal(): Promise<AuthenticatedPrincipal | null>;
 }
 
-export type ApprovalOperation = "issue" | "consume" | "revoke";
+export type ApprovalOperation = "grant" | "consume" | "revoke";
+export interface ApprovalPolicyDecision {
+  /** Immutable policy revision used for both this decision and the persisted grant. */
+  readonly version: string;
+  readonly authorized: boolean;
+}
 export interface ApprovalPolicy {
-  currentVersion(): Promise<string>;
+  /** Return the decision and revision from the same immutable policy snapshot. */
   authorize(input: {
     principal: AuthenticatedPrincipal;
     runId: string;
     actionType: string;
     operation: ApprovalOperation;
-  }): Promise<boolean>;
+  }): Promise<ApprovalPolicyDecision>;
 }
 
 export class ApprovalAuthorizationError extends Error {
@@ -34,7 +39,7 @@ const principalIdSchema = z.string().trim().min(1).max(256);
 const policyVersionSchema = z.string().trim().min(1).max(128);
 const approvalActionSchema = z.string().trim().min(1).max(128);
 
-export interface IssueApprovalInput {
+export interface GrantPermissionInput {
   runId: string;
   actionType: string;
   actionDescription: string;
@@ -50,8 +55,9 @@ export interface ConsumeApprovalInput {
 }
 
 /**
- * Server-side approval lifecycle. No principal ID is accepted by its public methods;
- * identity must come from an injected trusted source. Missing dependencies deny by default.
+ * Server-side permission-grant lifecycle. A grant is authorized by server policy for
+ * the authenticated principal; it is not an independent human approval. No principal
+ * ID is accepted by public methods. Missing identity or policy denies by default.
  */
 export class ApprovalAuthorizationService {
   constructor(
@@ -62,11 +68,11 @@ export class ApprovalAuthorizationService {
     private readonly makeId: () => string = randomUUID,
   ) {}
 
-  async issue(input: IssueApprovalInput): Promise<Approval> {
+  async grantPermission(input: GrantPermissionInput): Promise<Approval> {
     const principal = await this.requirePrincipal();
     const actionType = approvalActionSchema.parse(input.actionType);
     const runId = runIdSchema.parse(input.runId);
-    const policyVersion = await this.requirePolicy(principal, runId, actionType, "issue");
+    const policyVersion = await this.requirePolicy(principal, runId, actionType, "grant");
     const requestedAt = this.now();
     const expiresInSeconds = z.number().int().min(1).max(86_400).parse(input.expiresInSeconds);
     const expiresAt = new Date(Date.parse(requestedAt) + expiresInSeconds * 1000).toISOString();
@@ -91,9 +97,9 @@ export class ApprovalAuthorizationService {
     try {
       await this.repositories.events.append({
         runId,
-        type: "approval.approved",
+        type: "approval.granted",
         occurredAt: requestedAt,
-        data: { approvalId: approval.id, resolvedBy: principal.id },
+        data: { approvalId: approval.id, principalId: principal.id, policyVersion },
       });
     } catch (error) {
       await this.repositories.approvals.revoke(approval.id, principal.id, this.now());
@@ -108,28 +114,30 @@ export class ApprovalAuthorizationService {
     const approvalId = approvalIdSchema.parse(input.approvalId);
     const runId = runIdSchema.parse(input.runId);
     const actionType = approvalActionSchema.parse(input.actionType);
+    assertNotAborted(input.signal);
     const policyVersion = await this.requirePolicy(principal, runId, actionType, "consume");
     assertNotAborted(input.signal);
     const consumedAt = this.now();
-    const approval = await this.repositories.approvals.consume({
-      id: approvalId,
-      runId,
-      principalId: principal.id,
-      actionType,
-      policyVersion,
-      at: consumedAt,
-    });
     assertNotAborted(input.signal);
-    // Re-check after atomic consumption so a concurrent policy deployment fails closed.
-    const latestPolicyVersion = await this.policyVersion();
-    if (latestPolicyVersion !== policyVersion)
-      throw new ApprovalAuthorizationError("Approval policy changed during authorization");
-    await this.repositories.events.append({
-      runId,
-      type: "approval.consumed",
-      occurredAt: consumedAt,
-      data: { approvalId, principalId: principal.id, policyVersion, actionType },
-    });
+    const approval = await this.repositories.approvals.consumeWithEvent(
+      {
+        id: approvalId,
+        runId,
+        principalId: principal.id,
+        actionType,
+        policyVersion,
+        at: consumedAt,
+      },
+      {
+        runId,
+        type: "approval.consumed",
+        occurredAt: consumedAt,
+        data: { approvalId, principalId: principal.id, policyVersion, actionType },
+      },
+      () => input.signal?.aborted ?? false,
+    );
+    // Cancellation observed after the transaction commits does not unconsume the grant.
+    assertNotAborted(input.signal);
     return approval;
   }
 
@@ -170,15 +178,9 @@ export class ApprovalAuthorizationService {
     operation: ApprovalOperation,
   ): Promise<string> {
     if (!this.policy) throw new ApprovalAuthorizationError("Approval policy is unavailable");
-    const version = await this.policyVersion();
-    const allowed = await this.policy.authorize({ principal, runId, actionType, operation });
-    if (!allowed) throw new ApprovalAuthorizationError();
-    return version;
-  }
-
-  private async policyVersion(): Promise<string> {
-    if (!this.policy) throw new ApprovalAuthorizationError("Approval policy is unavailable");
-    return policyVersionSchema.parse(await this.policy.currentVersion());
+    const decision = await this.policy.authorize({ principal, runId, actionType, operation });
+    if (!decision.authorized) throw new ApprovalAuthorizationError();
+    return policyVersionSchema.parse(decision.version);
   }
 }
 

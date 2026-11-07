@@ -84,12 +84,9 @@ function policy(
 ): ApprovalPolicy {
   let version = options.version ?? "policy-v1";
   return {
-    async currentVersion() {
-      return version;
-    },
     async authorize() {
       options.onAuthorize?.();
-      return options.allowed ?? true;
+      return { version, authorized: options.allowed ?? true };
     },
     setVersion(value: string) {
       version = value;
@@ -111,7 +108,7 @@ function service(
 }
 
 async function issueGrant(approvalService = service()) {
-  return approvalService.issue({
+  return approvalService.grantPermission({
     runId,
     actionType: "workspace.write",
     actionDescription: "Allow writing to the isolated workspace",
@@ -143,19 +140,21 @@ describe("trusted approval policy", () => {
       principalId: "forged-user",
     };
     await expect(
-      service(null).issue(input as unknown as Parameters<ApprovalAuthorizationService["issue"]>[0]),
+      service(null).grantPermission(
+        input as unknown as Parameters<ApprovalAuthorizationService["grantPermission"]>[0],
+      ),
     ).rejects.toBeInstanceOf(ApprovalAuthorizationError);
-    await expect(service(principalSource(null)).issue(input)).rejects.toBeInstanceOf(
+    await expect(service(principalSource(null)).grantPermission(input)).rejects.toBeInstanceOf(
       ApprovalAuthorizationError,
     );
   });
 
   it("denies without policy or when the server policy refuses the action", async () => {
-    await expect(service(principalSource(), null).issue(await issueInput())).rejects.toThrow(
-      /policy is unavailable/,
-    );
     await expect(
-      service(principalSource(), policy({ allowed: false })).issue(await issueInput()),
+      service(principalSource(), null).grantPermission(await issueInput()),
+    ).rejects.toThrow(/policy is unavailable/);
+    await expect(
+      service(principalSource(), policy({ allowed: false })).grantPermission(await issueInput()),
     ).rejects.toBeInstanceOf(ApprovalAuthorizationError);
   });
 
@@ -166,12 +165,14 @@ describe("trusted approval policy", () => {
       headers: { "x-authenticated-user": "forged-header-user" },
     };
     await expect(
-      service(null).issue(input as unknown as Parameters<ApprovalAuthorizationService["issue"]>[0]),
+      service(null).grantPermission(
+        input as unknown as Parameters<ApprovalAuthorizationService["grantPermission"]>[0],
+      ),
     ).rejects.toThrow(/Trusted authentication is unavailable/);
     expect((await repositories.approvals.list(runId)).total).toBe(0);
   });
 
-  it("binds the persisted grant to the authenticated principal, exact run/action and policy", async () => {
+  it("issues a policy-authorized self-grant, not independent human approval", async () => {
     const grant = await issueGrant();
     expect(grant).toMatchObject({
       status: "approved",
@@ -181,8 +182,9 @@ describe("trusted approval policy", () => {
       policyVersion: "policy-v1",
       expiresAt: "2026-11-07T12:01:00.000Z",
     });
+    expect(grant.resolvedBy).toBe(grant.principalId);
     const events = await repositories.events.list({ runId });
-    expect(events.items.at(-1)).toMatchObject({ type: "approval.approved" });
+    expect(events.items.at(-1)).toMatchObject({ type: "approval.granted" });
 
     await expect(
       service(principalSource("another-user")).consume({
@@ -253,16 +255,14 @@ describe("trusted approval policy", () => {
     ).rejects.toThrow(/cancelled/);
   });
 
-  it("fails closed if policy changes during consumption", async () => {
+  it("uses the versioned policy snapshot that produced the authorization decision", async () => {
     const grant = await issueGrant();
     let currentVersion = "policy-v1";
     const changingPolicy: ApprovalPolicy = {
-      async currentVersion() {
-        return currentVersion;
-      },
       async authorize() {
+        const snapshotVersion = currentVersion;
         currentVersion = "policy-v2";
-        return true;
+        return { version: snapshotVersion, authorized: true };
       },
     };
     await expect(
@@ -271,20 +271,22 @@ describe("trusted approval policy", () => {
         runId,
         actionType: "workspace.write",
       }),
-    ).rejects.toThrow(/policy changed/);
-    expect((await repositories.approvals.getById(grant.id)).consumedAt).toBe(at);
+    ).resolves.toMatchObject({ consumedAt: at, policyVersion: "policy-v1" });
+    expect(currentVersion).toBe("policy-v2");
+    const events = await repositories.events.list({ runId });
+    expect(events.items.at(-1)).toMatchObject({
+      type: "approval.consumed",
+      data: expect.objectContaining({ policyVersion: "policy-v1" }),
+    });
   });
 
   it("stops if cancellation arrives while the policy is evaluating", async () => {
     const grant = await issueGrant();
     const controller = new AbortController();
     const cancellingPolicy: ApprovalPolicy = {
-      async currentVersion() {
-        return "policy-v1";
-      },
       async authorize() {
         controller.abort();
-        return true;
+        return { version: "policy-v1", authorized: true };
       },
     };
     await expect(
@@ -296,6 +298,101 @@ describe("trusted approval policy", () => {
       }),
     ).rejects.toThrow(/cancelled/);
     expect((await repositories.approvals.getById(grant.id)).consumedAt).toBeNull();
+  });
+
+  it("does not evaluate policy when cancelled before evaluation", async () => {
+    const grant = await issueGrant();
+    const controller = new AbortController();
+    controller.abort();
+    let evaluated = false;
+    const noPolicyEvaluation: ApprovalPolicy = {
+      async authorize() {
+        evaluated = true;
+        return { version: "policy-v1", authorized: true };
+      },
+    };
+    await expect(
+      service(principalSource(), noPolicyEvaluation).consume({
+        approvalId: grant.id,
+        runId,
+        actionType: "workspace.write",
+        signal: controller.signal,
+      }),
+    ).rejects.toThrow(/cancelled/);
+    expect(evaluated).toBe(false);
+  });
+
+  it("does not begin consumption when cancellation arrives immediately before it", async () => {
+    const grant = await issueGrant();
+    const controller = new AbortController();
+    const cancelAtConsumption = () => {
+      controller.abort();
+      return at;
+    };
+    await expect(
+      service(principalSource(), policy(), cancelAtConsumption).consume({
+        approvalId: grant.id,
+        runId,
+        actionType: "workspace.write",
+        signal: controller.signal,
+      }),
+    ).rejects.toThrow(/cancelled/);
+    expect((await repositories.approvals.getById(grant.id)).consumedAt).toBeNull();
+  });
+
+  it("rolls back when cancellation is observed during the transaction", async () => {
+    const grant = await issueGrant();
+    let reads = 0;
+    const signal = {
+      get aborted() {
+        reads += 1;
+        return reads >= 6;
+      },
+    } as AbortSignal;
+    await expect(
+      service().consume({
+        approvalId: grant.id,
+        runId,
+        actionType: "workspace.write",
+        signal,
+      }),
+    ).rejects.toThrow(/cancelled/);
+    expect((await repositories.approvals.getById(grant.id)).consumedAt).toBeNull();
+    expect(
+      (await repositories.events.list({ runId })).items.filter(
+        (event) => event.type === "approval.consumed",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("leaves the grant consumed if cancellation arrives immediately after commit", async () => {
+    const grant = await issueGrant();
+    const controller = new AbortController();
+    const approvalRepository = repositories.approvals;
+    const original = approvalRepository.consumeWithEvent.bind(approvalRepository);
+    approvalRepository.consumeWithEvent = (...args) => {
+      const result = original(...args);
+      controller.abort();
+      return result;
+    };
+    try {
+      await expect(
+        service().consume({
+          approvalId: grant.id,
+          runId,
+          actionType: "workspace.write",
+          signal: controller.signal,
+        }),
+      ).rejects.toThrow(/cancelled/);
+    } finally {
+      approvalRepository.consumeWithEvent = original;
+    }
+    expect((await repositories.approvals.getById(grant.id)).consumedAt).toBe(at);
+    expect(
+      (await repositories.events.list({ runId })).items.filter(
+        (event) => event.type === "approval.consumed",
+      ),
+    ).toHaveLength(1);
   });
 
   it("fails closed when the database fails during atomic consumption", async () => {

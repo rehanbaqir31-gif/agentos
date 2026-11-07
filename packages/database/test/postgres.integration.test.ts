@@ -311,16 +311,129 @@ describe(`PostgreSQL persistence (${testMode})`, () => {
       policyVersion: "policy-v1",
       at: fixedTime,
     };
-    const results = await Promise.allSettled([
-      repositories.approvals.consume(input),
-      repositories.approvals.consume(input),
-    ]);
+    const consume = (value: typeof input) =>
+      repositories.approvals.consumeWithEvent(value, {
+        runId: fixture.run.id,
+        type: "approval.consumed",
+        occurredAt: fixedTime,
+        data: {
+          approvalId: approval.id,
+          principalId: value.principalId,
+          policyVersion: value.policyVersion,
+          actionType: value.actionType,
+        },
+      });
+    const results = await Promise.allSettled([consume(input), consume(input)]);
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
     expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
     expect((await repositories.approvals.getById(approval.id)).consumedAt).toBe(fixedTime);
+    await expect(consume({ ...input, principalId: "wrong-principal" })).rejects.toBeInstanceOf(
+      RepositoryConflictError,
+    );
+  });
+
+  it("rolls approval consumption back if PostgreSQL cannot persist its audit event", async () => {
+    const fixture = await createFixture();
+    const principalId = "pg-audit-failure-user";
+    const approval = await repositories.approvals.create({
+      runId: fixture.run.id,
+      actionType: "workspace.write",
+      actionDescription: "Permit writes",
+      requestedPermissions: ["file.write"],
+      status: "approved",
+      requestedAt: fixedTime,
+      resolvedAt: fixedTime,
+      resolvedBy: principalId,
+      principalId,
+      policyVersion: "policy-v1",
+      expiresAt: "2026-11-05T13:00:00.000Z",
+    });
+    await database.pool.query(`
+      CREATE FUNCTION reject_approval_consumption_audit() RETURNS trigger
+      LANGUAGE plpgsql AS $$ BEGIN
+        IF NEW.type = 'approval.consumed' THEN
+          RAISE EXCEPTION 'audit storage unavailable';
+        END IF;
+        RETURN NEW;
+      END $$;
+      CREATE TRIGGER reject_approval_consumption_audit
+      BEFORE INSERT ON agent_events
+      FOR EACH ROW EXECUTE FUNCTION reject_approval_consumption_audit();
+    `);
     await expect(
-      repositories.approvals.consume({ ...input, principalId: "wrong-principal" }),
-    ).rejects.toBeInstanceOf(RepositoryConflictError);
+      repositories.approvals.consumeWithEvent(
+        {
+          id: approval.id,
+          runId: fixture.run.id,
+          principalId,
+          actionType: "workspace.write",
+          policyVersion: "policy-v1",
+          at: fixedTime,
+        },
+        {
+          runId: fixture.run.id,
+          type: "approval.consumed",
+          occurredAt: fixedTime,
+          data: {
+            approvalId: approval.id,
+            principalId,
+            policyVersion: "policy-v1",
+            actionType: "workspace.write",
+          },
+        },
+      ),
+    ).rejects.toThrow();
+    expect((await repositories.approvals.getById(approval.id)).consumedAt).toBeNull();
+    expect(
+      (await repositories.events.list({ runId: fixture.run.id })).items.filter(
+        (event) => event.type === "approval.consumed",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("serializes revocation racing with consumption so only one terminal action wins", async () => {
+    const fixture = await createFixture();
+    const principalId = "pg-race-user";
+    const approval = await repositories.approvals.create({
+      runId: fixture.run.id,
+      actionType: "workspace.write",
+      actionDescription: "Permit writes",
+      requestedPermissions: ["file.write"],
+      status: "approved",
+      requestedAt: fixedTime,
+      resolvedAt: fixedTime,
+      resolvedBy: principalId,
+      principalId,
+      policyVersion: "policy-v1",
+      expiresAt: "2026-11-05T13:00:00.000Z",
+    });
+    const input = {
+      id: approval.id,
+      runId: fixture.run.id,
+      principalId,
+      actionType: "workspace.write",
+      policyVersion: "policy-v1",
+      at: fixedTime,
+    };
+    const [consumed, revoked] = await Promise.allSettled([
+      repositories.approvals.consumeWithEvent(input, {
+        runId: fixture.run.id,
+        type: "approval.consumed",
+        occurredAt: fixedTime,
+        data: {
+          approvalId: approval.id,
+          principalId,
+          policyVersion: "policy-v1",
+          actionType: "workspace.write",
+        },
+      }),
+      repositories.approvals.revoke(approval.id, principalId, fixedTime),
+    ]);
+    expect(
+      [consumed.status, revoked.status].filter((status) => status === "fulfilled"),
+    ).toHaveLength(1);
+    const stored = await repositories.approvals.getById(approval.id);
+    expect(Number(stored.consumedAt !== null) + Number(stored.revokedAt !== null)).toBe(1);
   });
 
   it("enforces foreign keys and maps unique violations to repository errors", async () => {
