@@ -211,7 +211,8 @@ export class DockerIsolatedRuntime implements IsolatedRuntime {
         "network",
         "create",
         "--driver=bridge",
-        "--internal",
+        "--opt=com.docker.network.bridge.enable_ip_masquerade=false",
+        "--opt=com.docker.network.bridge.enable_icc=false",
         ...labels,
         network,
       ]);

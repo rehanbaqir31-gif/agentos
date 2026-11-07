@@ -124,9 +124,10 @@ suite("Docker runtime against a real daemon", () => {
       const network = JSON.parse(
         await docker("network", "inspect", inspected.HostConfig.NetworkMode),
       )[0] as {
-        Internal: boolean;
+        Options: Record<string, string>;
       };
-      expect(network.Internal).toBe(true);
+      expect(network.Options["com.docker.network.bridge.enable_ip_masquerade"]).toBe("false");
+      expect(network.Options["com.docker.network.bridge.enable_icc"]).toBe("false");
       expect(allocation.serverUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
       const healthResponse = await fetch(new URL("/global/health", allocation.serverUrl), {
         headers: { authorization: allocation.authorizationHeader },

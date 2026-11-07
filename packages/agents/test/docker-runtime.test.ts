@@ -51,7 +51,12 @@ describe("Docker isolated runtime", () => {
       const args = calls.find(({ args: called }) => called[0] === "run")?.args ?? [];
       expect(args).toContain("--network=agentos-018f86a6-19fd-7ac2-bd82-fd9637e1fb72-1");
       expect(
-        calls.some(({ args: called }) => called[0] === "network" && called.includes("--internal")),
+        calls.some(
+          ({ args: called }) =>
+            called[0] === "network" &&
+            called.includes("--opt=com.docker.network.bridge.enable_ip_masquerade=false") &&
+            called.includes("--opt=com.docker.network.bridge.enable_icc=false"),
+        ),
       ).toBe(true);
       expect(args).toContain("--read-only");
       expect(args).toContain("--user=10001:10001");
