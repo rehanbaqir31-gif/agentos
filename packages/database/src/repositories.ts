@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, count, desc, eq, gt, like, max } from "drizzle-orm";
+import { and, count, desc, eq, gt, isNull, like, max } from "drizzle-orm";
 import type {
   Agent,
   Approval,
@@ -606,6 +606,16 @@ export class ApprovalRepository {
   constructor(private readonly database: AgentOsDatabase) {}
   create(input: CreateApproval, id = randomUUID()): Approval {
     const value = approvalSchema.parse({ ...createApprovalSchema.parse(input), id });
+    if (
+      value.status === "approved" &&
+      (value.principalId === null ||
+        value.policyVersion === null ||
+        value.expiresAt === null ||
+        value.resolvedBy !== value.principalId)
+    )
+      throw new RelationshipValidationError(
+        "Approved grants must be bound to a principal and policy",
+      );
     try {
       this.database.orm.insert(approvals).values(value).run();
       return this.getById(value.id);
@@ -639,6 +649,8 @@ export class ApprovalRepository {
     return { items: rows.map((row) => approvalSchema.parse(row)), total, limit, offset };
   }
   resolve(id: string, status: "approved" | "rejected", resolvedBy: string): Approval {
+    if (status === "approved")
+      throw new RepositoryConflictError("Approvals require the trusted server-side policy service");
     const current = this.getById(id);
     if (current.status !== "pending")
       throw new RepositoryConflictError("Approval has already been resolved");
@@ -655,6 +667,56 @@ export class ApprovalRepository {
       .run();
     if (result.changes === 0)
       throw new RepositoryConflictError("Approval has already been resolved");
+    return this.getById(id);
+  }
+  consume(input: {
+    id: string;
+    runId: string;
+    principalId: string;
+    actionType: string;
+    policyVersion: string;
+    at: string;
+  }): Approval {
+    const result = this.database.orm
+      .update(approvals)
+      .set({ consumedAt: input.at })
+      .where(
+        and(
+          eq(approvals.id, assertId(input.id)),
+          eq(approvals.runId, assertId(input.runId)),
+          eq(approvals.principalId, input.principalId),
+          eq(approvals.resolvedBy, input.principalId),
+          eq(approvals.actionType, input.actionType),
+          eq(approvals.policyVersion, input.policyVersion),
+          eq(approvals.status, "approved"),
+          gt(approvals.expiresAt, input.at),
+          isNull(approvals.consumedAt),
+          isNull(approvals.revokedAt),
+        ),
+      )
+      .run();
+    if (result.changes === 0)
+      throw new RepositoryConflictError(
+        "Approval is invalid, expired, revoked, or already consumed",
+      );
+    return this.getById(input.id);
+  }
+  revoke(id: string, principalId: string, at: string): Approval {
+    const result = this.database.orm
+      .update(approvals)
+      .set({ revokedAt: at })
+      .where(
+        and(
+          eq(approvals.id, assertId(id)),
+          eq(approvals.principalId, principalId),
+          eq(approvals.status, "approved"),
+          isNull(approvals.consumedAt),
+          isNull(approvals.revokedAt),
+        ),
+      )
+      .run();
+    if (result.changes === 0)
+      throw new RepositoryConflictError("Approval cannot be revoked by this principal");
     return this.getById(id);
   }
 }

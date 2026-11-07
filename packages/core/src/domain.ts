@@ -263,6 +263,11 @@ const approvalBaseSchema = z
     requestedAt: timestamp,
     resolvedAt: timestamp.nullable(),
     resolvedBy: z.string().max(256).nullable(),
+    principalId: z.string().min(1).max(256).nullable().default(null),
+    policyVersion: z.string().min(1).max(128).nullable().default(null),
+    expiresAt: timestamp.nullable().default(null),
+    consumedAt: timestamp.nullable().default(null),
+    revokedAt: timestamp.nullable().default(null),
   })
   .strict();
 export const approvalSchema = approvalBaseSchema.superRefine((approval, context) => {
@@ -284,6 +289,33 @@ export const approvalSchema = approvalBaseSchema.superRefine((approval, context)
       code: "custom",
       path: ["resolvedAt"],
       message: "Resolved approvals require resolver and time",
+    });
+  }
+  if (approval.consumedAt !== null && approval.status !== "approved") {
+    context.addIssue({
+      code: "custom",
+      path: ["consumedAt"],
+      message: "Only an approved authorization can be consumed",
+    });
+  }
+  if (approval.revokedAt !== null && approval.status !== "approved") {
+    context.addIssue({
+      code: "custom",
+      path: ["revokedAt"],
+      message: "Only an approved authorization can be revoked",
+    });
+  }
+  if (
+    approval.principalId !== null &&
+    approval.status === "approved" &&
+    (approval.resolvedBy !== approval.principalId ||
+      approval.policyVersion === null ||
+      approval.expiresAt === null)
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["principalId"],
+      message: "Bound approvals require matching resolver, policy version and expiry",
     });
   }
 });

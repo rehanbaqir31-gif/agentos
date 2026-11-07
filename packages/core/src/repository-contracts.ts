@@ -108,6 +108,15 @@ export interface ApprovalRepositoryContract {
   getById(id: string): Awaitable<Approval>;
   list(runId: string, filter?: PageRequest): Awaitable<Page<Approval>>;
   resolve(id: string, status: "approved" | "rejected", resolvedBy: string): Awaitable<Approval>;
+  consume(input: {
+    id: string;
+    runId: string;
+    principalId: string;
+    actionType: string;
+    policyVersion: string;
+    at: string;
+  }): Awaitable<Approval>;
+  revoke(id: string, principalId: string, at: string): Awaitable<Approval>;
 }
 
 export interface EvaluationRepositoryContract {

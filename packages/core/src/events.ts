@@ -178,6 +178,33 @@ export const agentEventSchema = z.discriminatedUnion("type", [
   z
     .object({
       ...base,
+      type: z.literal("approval.consumed"),
+      data: z
+        .object({
+          approvalId: approvalIdSchema,
+          principalId: z.string().min(1).max(256),
+          policyVersion: z.string().min(1).max(128),
+          actionType: z.string().min(1).max(128),
+        })
+        .strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...base,
+      type: z.literal("approval.revoked"),
+      data: z
+        .object({
+          approvalId: approvalIdSchema,
+          principalId: z.string().min(1).max(256),
+          policyVersion: z.string().min(1).max(128),
+        })
+        .strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...base,
       type: z.literal("test.started"),
       data: z.object({ command: z.string().min(1).max(2_000) }).strict(),
     })

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, count, desc, eq, gt, ilike, sql } from "drizzle-orm";
+import { and, count, desc, eq, gt, ilike, isNull, sql } from "drizzle-orm";
 import type {
   Agent,
   AgentEvent,
@@ -694,6 +694,16 @@ export class PostgresApprovalRepository {
   constructor(private readonly database: AgentOsPostgresDatabase) {}
   async create(input: CreateApproval, id = randomUUID()): Promise<Approval> {
     const value = approvalSchema.parse({ ...createApprovalSchema.parse(input), id });
+    if (
+      value.status === "approved" &&
+      (value.principalId === null ||
+        value.policyVersion === null ||
+        value.expiresAt === null ||
+        value.resolvedBy !== value.principalId)
+    )
+      throw new RelationshipValidationError(
+        "Approved grants must be bound to a principal and policy",
+      );
     try {
       return approvalSchema.parse(
         one(await this.database.orm.insert(pgApprovals).values(value).returning(), "Approval", id),
@@ -734,6 +744,8 @@ export class PostgresApprovalRepository {
     status: "approved" | "rejected",
     resolvedBy: string,
   ): Promise<Approval> {
+    if (status === "approved")
+      throw new RepositoryConflictError("Approvals require the trusted server-side policy service");
     const current = await this.getById(id);
     if (current.status !== "pending")
       throw new RepositoryConflictError("Approval has already been resolved");
@@ -749,6 +761,56 @@ export class PostgresApprovalRepository {
       .where(and(eq(pgApprovals.id, current.id), eq(pgApprovals.status, "pending")))
       .returning();
     if (!rows.length) throw new RepositoryConflictError("Approval has already been resolved");
+    return approvalSchema.parse(normalizeTimestamps(rows[0]));
+  }
+  async consume(input: {
+    id: string;
+    runId: string;
+    principalId: string;
+    actionType: string;
+    policyVersion: string;
+    at: string;
+  }): Promise<Approval> {
+    const rows = await this.database.orm
+      .update(pgApprovals)
+      .set({ consumedAt: input.at })
+      .where(
+        and(
+          eq(pgApprovals.id, assertId(input.id)),
+          eq(pgApprovals.runId, assertId(input.runId)),
+          eq(pgApprovals.principalId, input.principalId),
+          eq(pgApprovals.resolvedBy, input.principalId),
+          eq(pgApprovals.actionType, input.actionType),
+          eq(pgApprovals.policyVersion, input.policyVersion),
+          eq(pgApprovals.status, "approved"),
+          gt(pgApprovals.expiresAt, input.at),
+          isNull(pgApprovals.consumedAt),
+          isNull(pgApprovals.revokedAt),
+        ),
+      )
+      .returning();
+    if (!rows.length)
+      throw new RepositoryConflictError(
+        "Approval is invalid, expired, revoked, or already consumed",
+      );
+    return approvalSchema.parse(normalizeTimestamps(rows[0]));
+  }
+  async revoke(id: string, principalId: string, at: string): Promise<Approval> {
+    const rows = await this.database.orm
+      .update(pgApprovals)
+      .set({ revokedAt: at })
+      .where(
+        and(
+          eq(pgApprovals.id, assertId(id)),
+          eq(pgApprovals.principalId, principalId),
+          eq(pgApprovals.status, "approved"),
+          isNull(pgApprovals.consumedAt),
+          isNull(pgApprovals.revokedAt),
+        ),
+      )
+      .returning();
+    if (!rows.length)
+      throw new RepositoryConflictError("Approval cannot be revoked by this principal");
     return approvalSchema.parse(normalizeTimestamps(rows[0]));
   }
 }

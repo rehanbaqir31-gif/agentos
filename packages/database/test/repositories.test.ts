@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AgentOsDatabase } from "../src/database.js";
-import { applyMigrations, openDatabase } from "../src/database.js";
+import { applyMigrations, openDatabase, rollbackLastMigration } from "../src/database.js";
 import {
   Repositories,
   RelationshipValidationError,
@@ -93,17 +93,43 @@ describe("SQLite database and repositories", () => {
   it("initializes versioned schema and applies migrations only once", () => {
     expect(database.sqlite.pragma("foreign_keys", { simple: true })).toBe(1);
     expect(database.sqlite.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({
-      n: 1,
+      n: 2,
     });
     applyMigrations(database.sqlite, migrations);
     expect(database.sqlite.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({
-      n: 1,
+      n: 2,
     });
     expect(() =>
       applyMigrations(database.sqlite, [
         { ...migrations[0]!, sql: `${migrations[0]!.sql}\n-- changed` },
       ]),
     ).toThrow("has changed");
+  });
+
+  it("rolls back the additive approval migration only when no approval audit fields are populated", async () => {
+    expect(rollbackLastMigration(database.sqlite)).toBe(2);
+    expect(database.sqlite.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({
+      n: 1,
+    });
+    applyMigrations(database.sqlite, migrations);
+    const fixture = await createFixture();
+    repositories.approvals.create({
+      runId: fixture.run.id,
+      actionType: "workspace.write",
+      actionDescription: "Permit writes",
+      requestedPermissions: ["file.write"],
+      status: "approved",
+      requestedAt: fixedTime,
+      resolvedAt: fixedTime,
+      resolvedBy: "local-user",
+      principalId: "local-user",
+      policyVersion: "policy-v1",
+      expiresAt: "2026-11-05T13:00:00.000Z",
+    });
+    expect(() => rollbackLastMigration(database.sqlite)).toThrow(/discard approval audit state/);
+    expect(database.sqlite.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({
+      n: 2,
+    });
   });
 
   it("uses an isolated data directory when no filename is provided", async () => {
@@ -264,12 +290,86 @@ describe("SQLite database and repositories", () => {
       resolvedAt: null,
       resolvedBy: null,
     });
-    expect(repositories.approvals.resolve(approval.id, "approved", "human:operator").status).toBe(
-      "approved",
+    expect(() => repositories.approvals.resolve(approval.id, "approved", "human:operator")).toThrow(
+      /trusted server-side policy service/,
+    );
+    expect(repositories.approvals.resolve(approval.id, "rejected", "human:operator").status).toBe(
+      "rejected",
     );
     expect(() => repositories.approvals.resolve(approval.id, "rejected", "human:operator")).toThrow(
       RepositoryConflictError,
     );
+  });
+
+  it("binds approval consumption to principal, run, action, policy, expiry and one-time use", async () => {
+    const fixture = await createFixture();
+    const principalId = "local-user-1";
+    const approval = repositories.approvals.create({
+      runId: fixture.run.id,
+      actionType: "workspace.write",
+      actionDescription: "Permit writes to this run workspace",
+      requestedPermissions: ["file.write"],
+      status: "approved",
+      requestedAt: fixedTime,
+      resolvedAt: fixedTime,
+      resolvedBy: principalId,
+      principalId,
+      policyVersion: "policy-v1",
+      expiresAt: "2026-11-05T13:00:00.000Z",
+    });
+    const consumeInput = {
+      id: approval.id,
+      runId: fixture.run.id,
+      principalId,
+      actionType: "workspace.write",
+      policyVersion: "policy-v1",
+      at: fixedTime,
+    };
+    const results = await Promise.allSettled([
+      Promise.resolve().then(() => repositories.approvals.consume(consumeInput)),
+      Promise.resolve().then(() => repositories.approvals.consume(consumeInput)),
+    ]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(repositories.approvals.getById(approval.id).consumedAt).toBe(fixedTime);
+    expect(() =>
+      repositories.approvals.consume({ ...consumeInput, principalId: "another-user" }),
+    ).toThrow(RepositoryConflictError);
+    expect(() =>
+      repositories.approvals.consume({ ...consumeInput, actionType: "network.access" }),
+    ).toThrow(RepositoryConflictError);
+  });
+
+  it("rejects expired and revoked approval consumption", async () => {
+    const fixture = await createFixture();
+    const createGrant = (expiresAt: string) =>
+      repositories.approvals.create({
+        runId: fixture.run.id,
+        actionType: "workspace.write",
+        actionDescription: "Permit writes",
+        requestedPermissions: ["file.write"],
+        status: "approved",
+        requestedAt: fixedTime,
+        resolvedAt: fixedTime,
+        resolvedBy: "local-user-1",
+        principalId: "local-user-1",
+        policyVersion: "policy-v1",
+        expiresAt,
+      });
+    const expired = createGrant("2026-11-05T11:59:59.000Z");
+    const revoked = createGrant("2026-11-05T13:00:00.000Z");
+    repositories.approvals.revoke(revoked.id, "local-user-1", fixedTime);
+    const consume = (id: string) =>
+      repositories.approvals.consume({
+        id,
+        runId: fixture.run.id,
+        principalId: "local-user-1",
+        actionType: "workspace.write",
+        policyVersion: "policy-v1",
+        at: fixedTime,
+      });
+    expect(() => consume(expired.id)).toThrow(RepositoryConflictError);
+    expect(() => consume(revoked.id)).toThrow(RepositoryConflictError);
   });
 
   it("rolls back a transaction and paginates deterministically", async () => {

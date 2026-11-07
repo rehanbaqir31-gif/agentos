@@ -216,6 +216,11 @@ export const approvals = sqliteTable(
     requestedAt: text("requested_at").notNull(),
     resolvedAt: text("resolved_at"),
     resolvedBy: text("resolved_by"),
+    principalId: text("principal_id"),
+    policyVersion: text("policy_version"),
+    expiresAt: text("expires_at"),
+    consumedAt: text("consumed_at"),
+    revokedAt: text("revoked_at"),
   },
   (table) => [index("approvals_run_status_idx").on(table.runId, table.status)],
 );

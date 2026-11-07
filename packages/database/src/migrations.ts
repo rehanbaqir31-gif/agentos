@@ -2,6 +2,8 @@ export interface Migration {
   version: number;
   name: string;
   sql: string;
+  downSql?: string;
+  rollbackCheckSql?: string;
 }
 
 export const migrations: readonly Migration[] = [
@@ -150,5 +152,26 @@ CREATE TABLE evaluations (
 );
 CREATE INDEX evaluations_run_created_idx ON evaluations(run_id, created_at);
 `,
+  },
+  {
+    version: 2,
+    name: "approval_identity_and_consumption",
+    sql: `
+ALTER TABLE approvals ADD COLUMN principal_id TEXT;
+ALTER TABLE approvals ADD COLUMN policy_version TEXT;
+ALTER TABLE approvals ADD COLUMN expires_at TEXT;
+ALTER TABLE approvals ADD COLUMN consumed_at TEXT;
+ALTER TABLE approvals ADD COLUMN revoked_at TEXT;
+CREATE INDEX approvals_run_principal_status_idx ON approvals(run_id, principal_id, status);
+`,
+    downSql: `
+DROP INDEX approvals_run_principal_status_idx;
+ALTER TABLE approvals DROP COLUMN revoked_at;
+ALTER TABLE approvals DROP COLUMN consumed_at;
+ALTER TABLE approvals DROP COLUMN expires_at;
+ALTER TABLE approvals DROP COLUMN policy_version;
+ALTER TABLE approvals DROP COLUMN principal_id;
+`,
+    rollbackCheckSql: `SELECT COUNT(*) AS count FROM approvals WHERE principal_id IS NOT NULL OR policy_version IS NOT NULL OR expires_at IS NOT NULL OR consumed_at IS NOT NULL OR revoked_at IS NOT NULL`,
   },
 ];

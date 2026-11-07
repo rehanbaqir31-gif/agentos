@@ -14,7 +14,7 @@ Threats include prompt injection, path traversal, unauthorized shell/network acc
 - Scope all file access to a run workspace and reject traversal after canonical path resolution.
 - Use least privilege, non-root sandbox execution where supported, bounded resources/timeouts, and no Docker socket inside agent containers.
 - Network access is denied by default when practical; allowlists are explicit.
-- Sensitive actions require an external approval decision recorded against the run; an agent cannot approve itself.
+- Sensitive actions require a server-authorized approval bound to the authenticated principal, run, exact action and active policy version; an agent cannot approve itself. If no trusted principal source exists, deny.
 - Keep secrets out of logs, ordinary database rows, command arguments where avoidable, and manifests. Mask captured output.
 - Domain schemas reject secret-named configuration fields and provider URLs containing embedded credentials; event serialization masks common token patterns. These checks are defense in depth and do not replace an OS-backed credential store or adapter output review.
 - Provider credentials are stored by reference. Environment references are resolved at request time and are read-only. OS credential operations require an injected keychain backend; no plaintext database or file fallback exists. The native platform backend is not yet implemented.
@@ -30,7 +30,7 @@ Local single-user mode trusts the host account and operating system. Docker is d
 
 SQLite is the default local database and PostgreSQL is supported for servers. PostgreSQL 16 migrations and integration tests pass in CI. Provider connections are direct outbound HTTP requests from the host process; they do not yet enforce an egress allowlist or network sandbox. Configure trusted endpoints and restrict network access at the host/firewall layer.
 
-The OpenCode SDK adapter currently supports installation/version probing, loopback health checks, session creation/resume, prompt submission, event streaming, abort, and local session-handle release. It requires an injected runtime and advertises isolation unavailable unless one is supplied. No concrete runtime exists yet; sandboxing, permissions, durable run/session association, and Git result collection have not been verified. OpenCode's `DELETE session` endpoint is intentionally not used because it destroys durable session history.
+The OpenCode SDK adapter supports installation/version probing, loopback health checks, session creation/resume, prompt submission, event streaming, abort, and local session-handle release. It requires an injected runtime and fails closed without one. A Docker runtime and durable coordinator exist, but their behavior has not been verified against a real Docker daemon or live OpenCode task. `ApprovalAuthorizationService` defines a server-side identity/policy port with atomic one-time consumption. No implementation of `TrustedPrincipalSource`, API authentication, or request authorization exists, so its missing identity path denies and the coordinator continues to permit only read-only runs. OpenCode's `DELETE session` endpoint is intentionally not used because it destroys durable session history.
 
 ## Verification plan
 

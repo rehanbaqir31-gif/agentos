@@ -1,5 +1,6 @@
 export {
   applyMigrations,
+  rollbackLastMigration,
   DatabaseInitializationError,
   openDatabase,
   type AgentOsDatabase,
@@ -17,6 +18,7 @@ export {
 } from "./database-config.js";
 export {
   applyPostgresMigrations,
+  rollbackLastPostgresMigration,
   openPostgresDatabase,
   PostgresInitializationError,
   type AgentOsPostgresDatabase,

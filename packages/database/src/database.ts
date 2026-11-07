@@ -92,6 +92,49 @@ export function applyMigrations(
   }
 }
 
+export function rollbackLastMigration(
+  sqlite: BetterSqlite3.Database,
+  migrationList: readonly Migration[] = migrations,
+): number | null {
+  let latest: { version: number; name: string } | undefined;
+  sqlite.exec("BEGIN IMMEDIATE");
+  try {
+    latest = sqlite
+      .prepare("SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1")
+      .get() as { version: number; name: string } | undefined;
+    if (!latest) {
+      sqlite.exec("COMMIT");
+      return null;
+    }
+    const current = latest;
+    const migration = migrationList.find((item) => item.version === current.version);
+    if (!migration || migration.name !== current.name || !migration.downSql)
+      throw new DatabaseInitializationError(
+        `Migration ${current.version}:${current.name} cannot be rolled back`,
+      );
+    if (migration.rollbackCheckSql) {
+      const result = sqlite.prepare(migration.rollbackCheckSql).get() as { count: number };
+      if (result.count > 0)
+        throw new DatabaseInitializationError(
+          "Migration rollback would discard approval audit state",
+        );
+    }
+    sqlite.exec(migration.downSql);
+    sqlite.prepare("DELETE FROM schema_migrations WHERE version = ?").run(current.version);
+    sqlite.exec("COMMIT");
+    return current.version;
+  } catch (error) {
+    sqlite.exec("ROLLBACK");
+    if (error instanceof DatabaseInitializationError) throw error;
+    throw new DatabaseInitializationError(
+      `Failed to roll back migration${latest ? ` ${latest.version}` : ""}`,
+      {
+        cause: error,
+      },
+    );
+  }
+}
+
 export async function openDatabase(options: DatabaseOptions): Promise<AgentOsDatabase> {
   if (options.filename && options.dataDirectory) {
     throw new DatabaseInitializationError("Set either filename or dataDirectory, not both");

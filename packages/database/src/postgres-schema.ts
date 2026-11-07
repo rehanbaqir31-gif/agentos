@@ -257,6 +257,11 @@ export const pgApprovals = pgTable(
     requestedAt: utcTimestamp("requested_at").notNull(),
     resolvedAt: utcTimestamp("resolved_at"),
     resolvedBy: text("resolved_by"),
+    principalId: text("principal_id"),
+    policyVersion: text("policy_version"),
+    expiresAt: utcTimestamp("expires_at"),
+    consumedAt: utcTimestamp("consumed_at"),
+    revokedAt: utcTimestamp("revoked_at"),
   },
   (table) => [
     check("approvals_status_check", sql`${table.status} in ('pending', 'approved', 'rejected')`),
