@@ -20,6 +20,10 @@ import type {
   WorkerLease,
   LeaseClaim,
   Task,
+  Principal,
+  AuthSession,
+  ProjectMembership,
+  ProjectRole,
 } from "./domain.js";
 import type { AgentEvent, CreateAgentEvent } from "./events.js";
 import type { RunStatus } from "./run-lifecycle.js";
@@ -211,6 +215,36 @@ export interface EvaluationRepositoryContract {
   list(runId: string, filter?: PageRequest): Awaitable<Page<Evaluation>>;
 }
 
+export interface AuthenticationRepositoryContract {
+  findAnyPrincipal(): Awaitable<Principal | null>;
+  getPrincipalByName(name: string): Awaitable<Principal | null>;
+  getPrincipal(id: string): Awaitable<Principal | null>;
+  verifyPasswordHash(
+    name: string,
+  ): Awaitable<{ principal: Principal; passwordHash: string } | null>;
+  createPrincipal(input: { name: string; passwordHash: string }, id?: string): Awaitable<Principal>;
+  revokePrincipal(id: string, at: string): Awaitable<boolean>;
+  createSession(
+    input: { principalId: string; expiresAt: string; tokenHash: string },
+    id?: string,
+  ): Awaitable<AuthSession>;
+  findSession(tokenHash: string): Awaitable<AuthSession | null>;
+  revokeSession(tokenHash: string, at: string): Awaitable<boolean>;
+  revokePrincipalSessions(principalId: string, at: string): Awaitable<number>;
+  addProjectMember(
+    projectId: string,
+    principalId: string,
+    role: ProjectRole,
+    at: string,
+  ): Awaitable<ProjectMembership>;
+  getProjectMembership(projectId: string, principalId: string): Awaitable<ProjectMembership | null>;
+  listProjectMemberships(projectId: string): Awaitable<ProjectMembership[]>;
+  listOwnedProjects(principalId: string, filter?: ProjectFilter): Awaitable<Page<Project>>;
+  listOwnedRuns(principalId: string, filter?: RunFilter): Awaitable<Page<ExecutionRun>>;
+  setRunOwner(runId: string, principalId: string, at: string): Awaitable<void>;
+  canAccessRun(runId: string, principalId: string): Awaitable<boolean>;
+}
+
 export interface RepositorySet {
   projects: ProjectRepositoryContract;
   agents: AgentRepositoryContract;
@@ -223,4 +257,5 @@ export interface RepositorySet {
   events: AgentEventRepositoryContract;
   approvals: ApprovalRepositoryContract;
   evaluations: EvaluationRepositoryContract;
+  auth: AuthenticationRepositoryContract;
 }

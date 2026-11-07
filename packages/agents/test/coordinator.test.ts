@@ -11,6 +11,7 @@ import type {
 } from "../src/contracts.js";
 import { adapterConfigSchema } from "../src/contracts.js";
 import { ExecutionCoordinator } from "../src/coordinator.js";
+import { ExecutionAuthorizationService } from "../src/approval-policy.js";
 import { AdapterRegistry } from "../src/registry.js";
 import { openDatabase } from "@agentos/database";
 import { Repositories } from "@agentos/database";
@@ -149,6 +150,10 @@ async function fixture(
     currentCommit: baseSha,
     settings: { permissionMode, networkAccess: "disabled" },
   });
+  const principal = await repositories.auth.createPrincipal({
+    name: "coordinator-test",
+    passwordHash: "test-only-not-a-credential",
+  });
   const agent = await repositories.agents.create({
     name: "OpenCode",
     adapterId: "test-opencode",
@@ -167,13 +172,30 @@ async function fixture(
     assignedAgentId: agent.id,
     configuration: {},
   });
-  return { directory, database, repositories, artifacts, project, agent, task };
+  return { directory, database, repositories, artifacts, project, agent, task, principal };
 }
 
-function coordinatorFor(f: Awaited<ReturnType<typeof fixture>>, adapter: AgentAdapter) {
+function coordinatorFor(
+  f: Awaited<ReturnType<typeof fixture>>,
+  adapter: AgentAdapter,
+  authorization = new ExecutionAuthorizationService(
+    f.repositories,
+    {
+      async currentPrincipal() {
+        return { id: f.principal.id };
+      },
+    },
+    {
+      async authorize() {
+        return { authorized: true, version: "test-policy-v1" };
+      },
+    },
+    () => at,
+  ),
+) {
   const registry = new AdapterRegistry();
   registry.register(adapter);
-  return new ExecutionCoordinator(f.repositories, registry, f.artifacts, () => at);
+  return new ExecutionCoordinator(f.repositories, registry, f.artifacts, () => at, authorization);
 }
 
 describe("durable execution coordinator", () => {
@@ -410,21 +432,21 @@ describe("durable execution coordinator", () => {
     }
   });
 
-  it("refuses supervised runs before allocating a session and records failure", async () => {
+  it("refuses supervised runs before creating or allocating a run", async () => {
     const f = await fixture("supervised");
     const runId = randomUUID();
     const { adapter, calls } = makeAdapter();
     try {
-      const outcome = await coordinatorFor(f, adapter).startTask({
-        taskId: f.task.id,
-        agentId: f.agent.id,
-        runId,
-      });
-      expect(outcome.run.status).toBe("failed");
+      await expect(
+        coordinatorFor(f, adapter).startTask({
+          taskId: f.task.id,
+          agentId: f.agent.id,
+          runId,
+        }),
+      ).rejects.toThrow(/disabled/i);
+      expect(() => f.repositories.runs.getById(runId)).toThrow();
       expect(calls.execute).toBe(0);
       expect(calls.closed).toBe(0);
-      const failed = await f.repositories.events.list({ runId });
-      expect(failed.items.at(-1)?.type).toBe("run.failed");
     } finally {
       f.database.close();
       await rm(f.directory, { recursive: true, force: true });
@@ -442,6 +464,165 @@ describe("durable execution coordinator", () => {
         coordinator.startTask({ taskId: f.task.id, agentId: f.agent.id, runId }),
       ).rejects.toThrow();
       expect(calls.execute).toBe(1);
+    } finally {
+      f.database.close();
+      await rm(f.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("denies task starts with missing trusted identity or policy", async () => {
+    const f = await fixture();
+    const { adapter, calls } = makeAdapter();
+    const registry = new AdapterRegistry();
+    registry.register(adapter);
+    const coordinator = new ExecutionCoordinator(f.repositories, registry, f.artifacts, () => at);
+    try {
+      await expect(
+        coordinator.startTask({ taskId: f.task.id, agentId: f.agent.id }),
+      ).rejects.toThrow(/authorization is unavailable/i);
+      expect(calls.execute).toBe(0);
+      expect((await f.repositories.auth.listOwnedRuns(f.principal.id)).items).toHaveLength(0);
+    } finally {
+      f.database.close();
+      await rm(f.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rechecks the current lease after policy evaluation before adapter invocation", async () => {
+    const f = await fixture();
+    const { adapter, calls } = makeAdapter();
+    let evaluations = 0;
+    let authorizationNow = at;
+    const authorization = new ExecutionAuthorizationService(
+      f.repositories,
+      {
+        async currentPrincipal() {
+          return { id: f.principal.id };
+        },
+      },
+      {
+        async authorize() {
+          evaluations++;
+          if (evaluations === 2)
+            f.database.sqlite
+              .prepare("UPDATE run_leases SET expires_at = ?")
+              .run("2026-11-07T12:00:01.000Z");
+          if (evaluations === 2) authorizationNow = "2026-11-07T12:00:02.000Z";
+          return { authorized: true, version: "test-policy-v1" };
+        },
+      },
+      () => authorizationNow,
+    );
+    try {
+      const outcome = await coordinatorFor(f, adapter, authorization).startTask({
+        taskId: f.task.id,
+        agentId: f.agent.id,
+      });
+      expect(outcome.run.status).toBe("failed");
+      expect(outcome.error).toMatch(/lease|authorization/i);
+      expect(calls.execute).toBe(0);
+      expect(evaluations).toBe(2);
+    } finally {
+      f.database.close();
+      await rm(f.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("honors cancellation during the final authorization check and never invokes the adapter", async () => {
+    const f = await fixture();
+    const { adapter, calls } = makeAdapter();
+    const controller = new AbortController();
+    let evaluations = 0;
+    const authorization = new ExecutionAuthorizationService(
+      f.repositories,
+      {
+        async currentPrincipal() {
+          return { id: f.principal.id };
+        },
+      },
+      {
+        async authorize() {
+          evaluations++;
+          if (evaluations === 2) controller.abort(new Error("cancelled before adapter invocation"));
+          return { authorized: true, version: "test-policy-v1" };
+        },
+      },
+      () => at,
+    );
+    try {
+      const outcome = await coordinatorFor(f, adapter, authorization).startTask({
+        taskId: f.task.id,
+        agentId: f.agent.id,
+        signal: controller.signal,
+      });
+      expect(outcome.run.status).toBe("cancelled");
+      expect(calls.execute).toBe(0);
+    } finally {
+      f.database.close();
+      await rm(f.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("denies when server policy is revoked between admission and adapter invocation", async () => {
+    const f = await fixture();
+    const { adapter, calls } = makeAdapter();
+    let evaluations = 0;
+    const authorization = new ExecutionAuthorizationService(
+      f.repositories,
+      {
+        async currentPrincipal() {
+          return { id: f.principal.id };
+        },
+      },
+      {
+        async authorize() {
+          evaluations++;
+          return { authorized: evaluations === 1, version: `policy-${evaluations}` };
+        },
+      },
+      () => at,
+    );
+    try {
+      const outcome = await coordinatorFor(f, adapter, authorization).startTask({
+        taskId: f.task.id,
+        agentId: f.agent.id,
+      });
+      expect(outcome.run.status).toBe("failed");
+      expect(calls.execute).toBe(0);
+      expect(evaluations).toBe(2);
+    } finally {
+      f.database.close();
+      await rm(f.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("denies if the trusted session is revoked during final policy evaluation", async () => {
+    const f = await fixture();
+    const { adapter, calls } = makeAdapter();
+    let principalLookups = 0;
+    const authorization = new ExecutionAuthorizationService(
+      f.repositories,
+      {
+        async currentPrincipal() {
+          principalLookups++;
+          return principalLookups < 3 ? { id: f.principal.id } : null;
+        },
+      },
+      {
+        async authorize() {
+          return { authorized: true, version: "policy-v1" };
+        },
+      },
+      () => at,
+    );
+    try {
+      const outcome = await coordinatorFor(f, adapter, authorization).startTask({
+        taskId: f.task.id,
+        agentId: f.agent.id,
+      });
+      expect(outcome.run.status).toBe("failed");
+      expect(calls.execute).toBe(0);
+      expect(principalLookups).toBeGreaterThanOrEqual(3);
     } finally {
       f.database.close();
       await rm(f.directory, { recursive: true, force: true });

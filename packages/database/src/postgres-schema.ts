@@ -8,6 +8,7 @@ import {
   bigint,
   jsonb,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   uniqueIndex,
@@ -45,6 +46,48 @@ export const pgProjects = pgTable(
   (table) => [
     uniqueIndex("projects_repository_path_uq").on(table.repositoryPath),
     index("projects_created_at_idx").on(table.createdAt),
+  ],
+);
+
+export const pgPrincipals = pgTable("principals", {
+  id: uuid("id").primaryKey(),
+  name: text("name").notNull().unique(),
+  authSource: text("auth_source", { enum: ["local_password"] }).notNull(),
+  passwordHash: text("password_hash").notNull(),
+  createdAt: utcTimestamp("created_at").notNull(),
+  disabledAt: utcTimestamp("disabled_at"),
+});
+
+export const pgAuthSessions = pgTable(
+  "auth_sessions",
+  {
+    id: uuid("id").primaryKey(),
+    principalId: uuid("principal_id")
+      .notNull()
+      .references(() => pgPrincipals.id, { onDelete: "cascade" }),
+    tokenHash: text("token_hash").notNull().unique(),
+    createdAt: utcTimestamp("created_at").notNull(),
+    expiresAt: utcTimestamp("expires_at").notNull(),
+    revokedAt: utcTimestamp("revoked_at"),
+  },
+  (table) => [index("auth_sessions_principal_idx").on(table.principalId, table.expiresAt)],
+);
+
+export const pgProjectMemberships = pgTable(
+  "project_memberships",
+  {
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => pgProjects.id, { onDelete: "cascade" }),
+    principalId: uuid("principal_id")
+      .notNull()
+      .references(() => pgPrincipals.id, { onDelete: "cascade" }),
+    role: text("role", { enum: ["owner", "maintainer", "viewer"] }).notNull(),
+    createdAt: utcTimestamp("created_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.projectId, table.principalId] }),
+    index("project_memberships_principal_idx").on(table.principalId, table.projectId),
   ],
 );
 
@@ -360,6 +403,20 @@ export const pgEvaluations = pgTable(
     createdAt: utcTimestamp("created_at").notNull(),
   },
   (table) => [index("evaluations_run_created_idx").on(table.runId, table.createdAt)],
+);
+
+export const pgRunOwners = pgTable(
+  "run_owners",
+  {
+    runId: uuid("run_id")
+      .primaryKey()
+      .references(() => pgExecutionRuns.id, { onDelete: "restrict" }),
+    principalId: uuid("principal_id")
+      .notNull()
+      .references(() => pgPrincipals.id, { onDelete: "restrict" }),
+    createdAt: utcTimestamp("created_at").notNull(),
+  },
+  (table) => [index("run_owners_principal_idx").on(table.principalId, table.runId)],
 );
 
 export const pgExecutionRunsRelations = relations(pgExecutionRuns, ({ one, many }) => ({

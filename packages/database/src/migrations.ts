@@ -227,4 +227,50 @@ DROP TABLE run_leases;
 `,
     rollbackCheckSql: "SELECT COUNT(*) AS count FROM run_leases",
   },
+  {
+    version: 5,
+    name: "trusted_principals_sessions_and_ownership",
+    sql: `
+CREATE TABLE principals (
+  id TEXT PRIMARY KEY NOT NULL,
+  name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+  auth_source TEXT NOT NULL CHECK (auth_source = 'local_password'),
+  password_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  disabled_at TEXT
+);
+CREATE TABLE auth_sessions (
+  id TEXT PRIMARY KEY NOT NULL,
+  principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT,
+  CHECK (expires_at > created_at)
+);
+CREATE INDEX auth_sessions_principal_idx ON auth_sessions(principal_id, expires_at);
+CREATE TABLE project_memberships (
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+  role TEXT NOT NULL CHECK (role IN ('owner', 'maintainer', 'viewer')),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (project_id, principal_id)
+);
+CREATE INDEX project_memberships_principal_idx ON project_memberships(principal_id, project_id);
+CREATE TABLE run_owners (
+  run_id TEXT PRIMARY KEY NOT NULL REFERENCES execution_runs(id) ON DELETE RESTRICT,
+  principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX run_owners_principal_idx ON run_owners(principal_id, run_id);
+`,
+    downSql: `
+DROP TABLE run_owners;
+DROP TABLE project_memberships;
+DROP TABLE auth_sessions;
+DROP TABLE principals;
+`,
+    rollbackCheckSql:
+      "SELECT (SELECT count(*) FROM principals) + (SELECT count(*) FROM auth_sessions) + (SELECT count(*) FROM project_memberships) + (SELECT count(*) FROM run_owners) AS count",
+  },
 ];

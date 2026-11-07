@@ -131,7 +131,13 @@ describe(`PostgreSQL persistence (${testMode})`, () => {
     const rows = await database.pool.query(
       "SELECT version FROM schema_migrations ORDER BY version",
     );
-    expect(rows.rows).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
+    expect(rows.rows).toEqual([
+      { version: 1 },
+      { version: 2 },
+      { version: 3 },
+      { version: 4 },
+      { version: 5 },
+    ]);
     await expect(
       applyPostgresMigrations(database.pool, [
         { ...postgresMigrations[0]!, sql: `${postgresMigrations[0]!.sql}\n-- changed` },
@@ -140,6 +146,7 @@ describe(`PostgreSQL persistence (${testMode})`, () => {
   });
 
   it("reverses the additive approval migration only before approval audit data is written", async () => {
+    expect(await rollbackLastPostgresMigration(database.pool)).toBe(5);
     expect(await rollbackLastPostgresMigration(database.pool)).toBe(4);
     expect(await rollbackLastPostgresMigration(database.pool)).toBe(3);
     expect(await rollbackLastPostgresMigration(database.pool)).toBe(2);
@@ -162,6 +169,7 @@ describe(`PostgreSQL persistence (${testMode})`, () => {
       policyVersion: "policy-v1",
       expiresAt: "2026-11-05T13:00:00.000Z",
     });
+    expect(await rollbackLastPostgresMigration(database.pool)).toBe(5);
     expect(await rollbackLastPostgresMigration(database.pool)).toBe(4);
     expect(await rollbackLastPostgresMigration(database.pool)).toBe(3);
     await expect(rollbackLastPostgresMigration(database.pool)).rejects.toThrow(
@@ -236,6 +244,49 @@ describe(`PostgreSQL persistence (${testMode})`, () => {
     expect(await repositories.providers.getById(fixture.provider.id)).toEqual(fixture.provider);
     expect(await repositories.tasks.getById(fixture.task.id)).toEqual(fixture.task);
     expect(await repositories.runs.getById(fixture.run.id)).toEqual(fixture.run);
+  });
+
+  it("provisions trusted principal ownership, sessions, and run authorization", async () => {
+    const fixture = await createFixture();
+    const principal = await repositories.auth.createPrincipal({
+      name: "pg-owner",
+      passwordHash: "scrypt$test",
+    });
+    expect(await repositories.auth.findAnyPrincipal()).toEqual(principal);
+    expect(
+      await repositories.auth.getProjectMembership(fixture.project.id, principal.id),
+    ).toMatchObject({ role: "owner" });
+    expect(
+      (await repositories.auth.listOwnedProjects(principal.id)).items.map((item) => item.id),
+    ).toContain(fixture.project.id);
+    expect(await repositories.auth.canAccessRun(fixture.run.id, principal.id)).toBe(true);
+    await expect(
+      repositories.auth.createPrincipal({ name: "second-owner", passwordHash: "scrypt$test" }),
+    ).rejects.toThrow(/already been created/);
+
+    const stranger = randomUUID();
+    await database.pool.query(
+      "INSERT INTO principals(id, name, auth_source, password_hash, created_at) VALUES ($1, 'pg-stranger', 'local_password', 'scrypt$test', $2)",
+      [stranger, fixedTime],
+    );
+    expect(await repositories.auth.getProjectMembership(fixture.project.id, stranger)).toBeNull();
+    expect(await repositories.auth.canAccessRun(fixture.run.id, stranger)).toBe(false);
+    await repositories.auth.setRunOwner(fixture.run.id, stranger, fixedTime);
+    expect(await repositories.auth.canAccessRun(fixture.run.id, stranger)).toBe(false);
+    expect(await repositories.auth.canAccessRun(fixture.run.id, principal.id)).toBe(true);
+
+    const tokenHash = "b".repeat(64);
+    const session = await repositories.auth.createSession({
+      principalId: principal.id,
+      tokenHash,
+      expiresAt: "2026-11-05T13:00:00.000Z",
+    });
+    expect(await repositories.auth.findSession(tokenHash)).toEqual(session);
+    expect(await repositories.auth.revokePrincipal(principal.id, fixedTime)).toBe(true);
+    expect(await repositories.auth.findSession(tokenHash)).toBeNull();
+    expect(await repositories.auth.getPrincipal(principal.id)).toMatchObject({
+      disabledAt: fixedTime,
+    });
   });
 
   it("persists an immutable manifest and enforces its run relationship", async () => {

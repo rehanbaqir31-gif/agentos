@@ -68,6 +68,7 @@ import {
   RepositoryNotFoundError,
   translateError,
 } from "./repository-common.js";
+import { SqliteAuthenticationRepository } from "./auth-repositories.js";
 import {
   agentEvents,
   agents,
@@ -1348,6 +1349,7 @@ export class EvaluationRepository {
 }
 
 export class Repositories implements RepositorySet {
+  readonly auth: SqliteAuthenticationRepository;
   readonly projects: ProjectRepository;
   readonly agents: AgentRepository;
   readonly providers: ProviderRepository;
@@ -1361,6 +1363,7 @@ export class Repositories implements RepositorySet {
   readonly evaluations: EvaluationRepository;
 
   constructor(database: AgentOsDatabase) {
+    this.auth = new SqliteAuthenticationRepository(database);
     this.projects = new ProjectRepository(database);
     this.agents = new AgentRepository(database);
     this.providers = new ProviderRepository(database);

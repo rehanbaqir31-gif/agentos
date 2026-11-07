@@ -58,6 +58,7 @@ import {
   workerLeaseSchema,
 } from "@agentos/core";
 import type { AgentOsPostgresDatabase } from "./postgres-database.js";
+import { PostgresAuthenticationRepository } from "./auth-repositories.js";
 import {
   pgAgentEvents,
   pgAgents,
@@ -1503,6 +1504,7 @@ export class PostgresEvaluationRepository {
 }
 
 export class PostgresRepositories implements RepositorySet {
+  readonly auth: PostgresAuthenticationRepository;
   readonly projects: PostgresProjectRepository;
   readonly agents: PostgresAgentRepository;
   readonly providers: PostgresProviderRepository;
@@ -1516,6 +1518,7 @@ export class PostgresRepositories implements RepositorySet {
   readonly evaluations: PostgresEvaluationRepository;
 
   constructor(database: AgentOsPostgresDatabase) {
+    this.auth = new PostgresAuthenticationRepository(database);
     this.projects = new PostgresProjectRepository(database);
     this.agents = new PostgresAgentRepository(database);
     this.providers = new PostgresProviderRepository(database);

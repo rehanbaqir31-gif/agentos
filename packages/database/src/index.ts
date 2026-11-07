@@ -9,6 +9,10 @@ export {
 } from "./database.js";
 export { migrations, type Migration } from "./migrations.js";
 export {
+  SqliteAuthenticationRepository,
+  PostgresAuthenticationRepository,
+} from "./auth-repositories.js";
+export {
   DatabaseConfigurationError,
   loadDatabaseConfig,
   openConfiguredDatabase,

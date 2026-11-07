@@ -14,6 +14,7 @@ import {
 import { RepositoryConflictError } from "@agentos/database";
 import { AdapterRegistry } from "./registry.js";
 import { ArtifactService } from "./artifact-service.js";
+import { ExecutionAuthorizationService } from "./approval-policy.js";
 import type { RunManifest } from "@agentos/core";
 import type {
   AgentAdapter,
@@ -46,6 +47,7 @@ export class ExecutionCoordinator {
     private readonly adapters: AdapterRegistry,
     private readonly artifacts: ArtifactService,
     private readonly now: () => string = () => new Date().toISOString(),
+    private readonly executionAuthorization?: ExecutionAuthorizationService,
   ) {}
 
   /** Claims only runs whose prior lease is absent, released or expired. Prompts are never replayed. */
@@ -164,6 +166,13 @@ export class ExecutionCoordinator {
   async startTask(input: StartTaskInput): Promise<ExecutionOutcome> {
     const task = await this.repositories.tasks.getById(input.taskId);
     const project = await this.repositories.projects.getById(task.projectId);
+    if (!this.executionAuthorization)
+      throw new Error("Execution authorization is unavailable; task start was denied");
+    const principal = await this.executionAuthorization.authorizeTaskStart({
+      projectId: project.id,
+      taskId: task.id,
+      ...(input.signal ? { signal: input.signal } : {}),
+    });
     const agent = await this.repositories.agents.getById(input.agentId);
     if (!agent.enabled) throw new Error("Selected agent is disabled");
     if (task.assignedAgentId && task.assignedAgentId !== agent.id)
@@ -205,6 +214,7 @@ export class ExecutionCoordinator {
       id,
     );
     const identity: RunLeaseIdentity = { workerId: lease.workerId, generation: lease.generation };
+    await this.repositories.auth.setRunOwner(run.id, principal.id, this.now());
     await this.append(
       {
         runId: run.id,
@@ -322,11 +332,22 @@ export class ExecutionCoordinator {
       });
       await streamReady;
       if (streamError) throw streamError;
-      const executionResult = await adapter.execute(
-        config,
-        session,
-        `${task.title}\n\n${task.description}`,
-        controller.signal,
+      if (!this.executionAuthorization)
+        throw new Error("Execution authorization is unavailable; adapter invocation was denied");
+      const executionResult = await this.executionAuthorization.runAuthorized(
+        {
+          runId: run.id,
+          projectId: project.id,
+          identity,
+          signal: controller.signal,
+        },
+        () =>
+          adapter.execute(
+            config,
+            session!,
+            `${task.title}\n\n${task.description}`,
+            controller.signal,
+          ),
       );
       streamAbort.abort();
       await streamTask;

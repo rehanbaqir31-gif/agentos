@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import type { Approval, RepositorySet } from "@agentos/core";
+import type { Approval, RepositorySet, RunLeaseIdentity } from "@agentos/core";
 import { approvalIdSchema, redactEventSecrets, runIdSchema } from "@agentos/core";
 
 export interface AuthenticatedPrincipal {
@@ -12,7 +12,7 @@ export interface TrustedPrincipalSource {
   currentPrincipal(): Promise<AuthenticatedPrincipal | null>;
 }
 
-export type ApprovalOperation = "grant" | "consume" | "revoke";
+export type ApprovalOperation = "grant" | "consume" | "revoke" | "execute";
 export interface ApprovalPolicyDecision {
   /** Immutable policy revision used for both this decision and the persisted grant. */
   readonly version: string;
@@ -181,6 +181,162 @@ export class ApprovalAuthorizationService {
     const decision = await this.policy.authorize({ principal, runId, actionType, operation });
     if (!decision.authorized) throw new ApprovalAuthorizationError();
     return policyVersionSchema.parse(decision.version);
+  }
+}
+
+/** Authorization checks repeated at task admission and immediately before adapter execution. */
+export class ExecutionAuthorizationService {
+  constructor(
+    private readonly repositories: RepositorySet,
+    private readonly principals: TrustedPrincipalSource | undefined,
+    private readonly policy: ApprovalPolicy | undefined,
+    private readonly now: () => string = () => new Date().toISOString(),
+  ) {}
+
+  async authorizeTaskStart(input: {
+    projectId: string;
+    taskId: string;
+    signal?: AbortSignal;
+  }): Promise<AuthenticatedPrincipal> {
+    assertNotAborted(input.signal);
+    const principal = await this.requirePrincipal();
+    const membership = await this.repositories.auth.getProjectMembership(
+      input.projectId,
+      principal.id,
+    );
+    if (!membership || membership.role === "viewer") throw new ApprovalAuthorizationError();
+    const project = await this.repositories.projects.getById(input.projectId);
+    if (project.settings.permissionMode !== "read_only")
+      throw new ApprovalAuthorizationError("Write-capable execution is disabled");
+    await this.authorizePolicy(principal, input.taskId, "agent.execute.read_only", "execute");
+    const current = await this.requirePrincipal();
+    if (current.id !== principal.id)
+      throw new ApprovalAuthorizationError("Principal changed during authorization");
+    const currentMembership = await this.repositories.auth.getProjectMembership(
+      input.projectId,
+      current.id,
+    );
+    if (!currentMembership || currentMembership.role === "viewer")
+      throw new ApprovalAuthorizationError();
+    const [currentTask, currentProject] = await Promise.all([
+      this.repositories.tasks.getById(input.taskId),
+      this.repositories.projects.getById(input.projectId),
+    ]);
+    if (
+      currentTask.projectId !== input.projectId ||
+      currentTask.status === "completed" ||
+      currentTask.status === "cancelled" ||
+      currentProject.settings.permissionMode !== "read_only"
+    )
+      throw new ApprovalAuthorizationError("Task authorization changed before run creation");
+    assertNotAborted(input.signal);
+    return principal;
+  }
+
+  async authorizeImmediatelyBeforeExecution(input: {
+    runId: string;
+    projectId: string;
+    identity: RunLeaseIdentity;
+    signal?: AbortSignal;
+  }): Promise<void> {
+    await this.validateImmediatelyBeforeExecution(input);
+  }
+
+  async runAuthorized<T>(
+    input: {
+      runId: string;
+      projectId: string;
+      identity: RunLeaseIdentity;
+      signal?: AbortSignal;
+    },
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    await this.validateImmediatelyBeforeExecution(input);
+    // Invoke the protected operation in the same server-side continuation as the final checks.
+    return operation();
+  }
+
+  private async validateImmediatelyBeforeExecution(input: {
+    runId: string;
+    projectId: string;
+    identity: RunLeaseIdentity;
+    signal?: AbortSignal;
+  }): Promise<void> {
+    assertNotAborted(input.signal);
+    const principal = await this.requirePrincipal();
+    const run = await this.repositories.runs.getById(input.runId);
+    if (run.projectId !== input.projectId || run.status !== "running")
+      throw new ApprovalAuthorizationError("Run is not authorized to execute");
+    const membership = await this.repositories.auth.getProjectMembership(
+      input.projectId,
+      principal.id,
+    );
+    if (!membership || membership.role === "viewer") throw new ApprovalAuthorizationError();
+    const lease = await this.repositories.leases.getByRunId(input.runId);
+    if (
+      !lease ||
+      lease.workerId !== input.identity.workerId ||
+      lease.generation !== input.identity.generation ||
+      lease.releasedAt !== null ||
+      Date.parse(lease.expiresAt) <= Date.parse(this.now())
+    )
+      throw new ApprovalAuthorizationError("Run lease is no longer current");
+    const project = await this.repositories.projects.getById(input.projectId);
+    if (project.settings.permissionMode !== "read_only")
+      throw new ApprovalAuthorizationError("Write-capable execution is disabled");
+    await this.authorizePolicy(principal, input.runId, "agent.execute.read_only", "execute");
+    assertNotAborted(input.signal);
+    const current = await this.requirePrincipal();
+    if (current.id !== principal.id)
+      throw new ApprovalAuthorizationError("Principal changed during authorization");
+    const currentRun = await this.repositories.runs.getById(input.runId);
+    const currentTask = await this.repositories.tasks.getById(currentRun.taskId);
+    const currentMembership = await this.repositories.auth.getProjectMembership(
+      input.projectId,
+      current.id,
+    );
+    const currentLease = await this.repositories.leases.getByRunId(input.runId);
+    const currentProject = await this.repositories.projects.getById(input.projectId);
+    if (
+      currentRun.projectId !== input.projectId ||
+      currentRun.status !== "running" ||
+      currentTask.status === "completed" ||
+      currentTask.status === "cancelled" ||
+      currentProject.settings.permissionMode !== "read_only" ||
+      !currentMembership ||
+      currentMembership.role === "viewer" ||
+      !currentLease ||
+      currentLease.workerId !== input.identity.workerId ||
+      currentLease.generation !== input.identity.generation ||
+      currentLease.releasedAt !== null ||
+      Date.parse(currentLease.expiresAt) <= Date.parse(this.now())
+    )
+      throw new ApprovalAuthorizationError("Authorization changed before execution");
+    assertNotAborted(input.signal);
+  }
+
+  private async requirePrincipal(): Promise<AuthenticatedPrincipal> {
+    if (!this.principals)
+      throw new ApprovalAuthorizationError("Trusted authentication is unavailable");
+    const principal = await this.principals.currentPrincipal();
+    if (!principal) throw new ApprovalAuthorizationError("Authenticated principal is required");
+    principalIdSchema.parse(principal.id);
+    const persisted = await this.repositories.auth.getPrincipal(principal.id);
+    if (!persisted || persisted.disabledAt)
+      throw new ApprovalAuthorizationError("Principal is unavailable");
+    return principal;
+  }
+
+  private async authorizePolicy(
+    principal: AuthenticatedPrincipal,
+    runId: string,
+    actionType: string,
+    operation: ApprovalOperation,
+  ): Promise<void> {
+    if (!this.policy) throw new ApprovalAuthorizationError("Current server policy is unavailable");
+    const result = await this.policy.authorize({ principal, runId, actionType, operation });
+    if (!result.authorized) throw new ApprovalAuthorizationError();
+    policyVersionSchema.parse(result.version);
   }
 }
 

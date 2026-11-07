@@ -22,6 +22,45 @@ export type ApprovalId = z.infer<typeof approvalIdSchema>;
 export type EvaluationId = z.infer<typeof evaluationIdSchema>;
 export type AgentEventId = z.infer<typeof agentEventIdSchema>;
 export type ArtifactId = z.infer<typeof artifactIdSchema>;
+
+export const principalIdSchema = z.string().uuid().brand<"PrincipalId">();
+export const sessionIdSchema = z.string().uuid().brand<"AuthSessionId">();
+export type PrincipalId = z.infer<typeof principalIdSchema>;
+export type AuthSessionId = z.infer<typeof sessionIdSchema>;
+
+export const principalSchema = z
+  .object({
+    id: principalIdSchema,
+    authSource: z.literal("local_password"),
+    createdAt: z.iso.datetime(),
+    disabledAt: z.iso.datetime().nullable(),
+  })
+  .strict();
+export type Principal = z.infer<typeof principalSchema>;
+
+export const sessionSchema = z
+  .object({
+    id: sessionIdSchema,
+    principalId: principalIdSchema,
+    createdAt: z.iso.datetime(),
+    expiresAt: z.iso.datetime(),
+    revokedAt: z.iso.datetime().nullable(),
+  })
+  .strict();
+export type AuthSession = z.infer<typeof sessionSchema>;
+
+export const projectRoleSchema = z.enum(["owner", "maintainer", "viewer"]);
+export type ProjectRole = z.infer<typeof projectRoleSchema>;
+
+export const projectMembershipSchema = z
+  .object({
+    projectId: projectIdSchema,
+    principalId: principalIdSchema,
+    role: projectRoleSchema,
+    createdAt: z.iso.datetime(),
+  })
+  .strict();
+export type ProjectMembership = z.infer<typeof projectMembershipSchema>;
 const timestamp = z.iso.datetime();
 const name = z.string().trim().min(1).max(200);
 const description = z.string().max(20_000);

@@ -93,11 +93,11 @@ describe("SQLite database and repositories", () => {
   it("initializes versioned schema and applies migrations only once", () => {
     expect(database.sqlite.pragma("foreign_keys", { simple: true })).toBe(1);
     expect(database.sqlite.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({
-      n: 4,
+      n: 5,
     });
     applyMigrations(database.sqlite, migrations);
     expect(database.sqlite.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({
-      n: 4,
+      n: 5,
     });
     expect(() =>
       applyMigrations(database.sqlite, [
@@ -107,6 +107,7 @@ describe("SQLite database and repositories", () => {
   });
 
   it("rolls back the additive approval migration only when no approval audit fields are populated", async () => {
+    expect(rollbackLastMigration(database.sqlite)).toBe(5);
     expect(rollbackLastMigration(database.sqlite)).toBe(4);
     expect(rollbackLastMigration(database.sqlite)).toBe(3);
     expect(rollbackLastMigration(database.sqlite)).toBe(2);
@@ -128,6 +129,7 @@ describe("SQLite database and repositories", () => {
       policyVersion: "policy-v1",
       expiresAt: "2026-11-05T13:00:00.000Z",
     });
+    expect(rollbackLastMigration(database.sqlite)).toBe(5);
     expect(rollbackLastMigration(database.sqlite)).toBe(4);
     expect(rollbackLastMigration(database.sqlite)).toBe(3);
     expect(() => rollbackLastMigration(database.sqlite)).toThrow(/discard approval audit state/);
@@ -574,6 +576,51 @@ describe("SQLite database and repositories", () => {
     expect(repositories.events.list({ runId: fixture.run.id }).total).toBe(1);
     database.close();
     database.close();
+  });
+
+  it("provisions one trusted local principal, adopts legacy projects and scopes sessions and runs", async () => {
+    const fixture = await createFixture();
+    expect(database.sqlite.prepare("SELECT id, name FROM principals").all()).toEqual([]);
+    const principal = await repositories.auth.createPrincipal({
+      name: "local-owner",
+      passwordHash: "scrypt$test",
+    });
+    expect(await repositories.auth.findAnyPrincipal()).toEqual(principal);
+    expect(
+      await repositories.auth.getProjectMembership(fixture.project.id, principal.id),
+    ).toMatchObject({ role: "owner" });
+    expect(
+      (await repositories.auth.listOwnedProjects(principal.id)).items.map((item) => item.id),
+    ).toContain(fixture.project.id);
+    expect(await repositories.auth.canAccessRun(fixture.run.id, principal.id)).toBe(true);
+    expect(() =>
+      repositories.auth.createPrincipal({ name: "second-owner", passwordHash: "scrypt$test" }),
+    ).toThrow(/already been created/);
+
+    const stranger = randomUUID();
+    database.sqlite
+      .prepare(
+        "INSERT INTO principals(id, name, auth_source, password_hash, created_at) VALUES (?, 'stranger', 'local_password', 'scrypt$test', ?)",
+      )
+      .run(stranger, fixedTime);
+    expect(await repositories.auth.getProjectMembership(fixture.project.id, stranger)).toBeNull();
+    expect(await repositories.auth.canAccessRun(fixture.run.id, stranger)).toBe(false);
+    await repositories.auth.setRunOwner(fixture.run.id, stranger, fixedTime);
+    expect(await repositories.auth.canAccessRun(fixture.run.id, stranger)).toBe(false);
+    expect(await repositories.auth.canAccessRun(fixture.run.id, principal.id)).toBe(true);
+
+    const tokenHash = "a".repeat(64);
+    const authSession = await repositories.auth.createSession({
+      principalId: principal.id,
+      tokenHash,
+      expiresAt: "2026-11-05T13:00:00.000Z",
+    });
+    expect(await repositories.auth.findSession(tokenHash)).toEqual(authSession);
+    expect(await repositories.auth.revokePrincipal(principal.id, fixedTime)).toBe(true);
+    expect(await repositories.auth.findSession(tokenHash)).toBeNull();
+    expect(await repositories.auth.getPrincipal(principal.id)).toMatchObject({
+      disabledAt: fixedTime,
+    });
   });
 
   it("serializes writes from two database connections and keeps pagination counts accurate", async () => {

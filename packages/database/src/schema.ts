@@ -4,6 +4,7 @@ import {
   foreignKey,
   index,
   integer,
+  primaryKey,
   sqliteTable,
   text,
   uniqueIndex,
@@ -37,6 +38,48 @@ export const projects = sqliteTable(
   (table) => [
     uniqueIndex("projects_repository_path_uq").on(table.repositoryPath),
     index("projects_created_at_idx").on(table.createdAt),
+  ],
+);
+
+export const principals = sqliteTable("principals", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull().unique(),
+  authSource: text("auth_source", { enum: ["local_password"] }).notNull(),
+  passwordHash: text("password_hash").notNull(),
+  createdAt: text("created_at").notNull(),
+  disabledAt: text("disabled_at"),
+});
+
+export const authSessions = sqliteTable(
+  "auth_sessions",
+  {
+    id: text("id").primaryKey(),
+    principalId: text("principal_id")
+      .notNull()
+      .references(() => principals.id, { onDelete: "cascade" }),
+    tokenHash: text("token_hash").notNull().unique(),
+    createdAt: text("created_at").notNull(),
+    expiresAt: text("expires_at").notNull(),
+    revokedAt: text("revoked_at"),
+  },
+  (table) => [index("auth_sessions_principal_idx").on(table.principalId, table.expiresAt)],
+);
+
+export const projectMemberships = sqliteTable(
+  "project_memberships",
+  {
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    principalId: text("principal_id")
+      .notNull()
+      .references(() => principals.id, { onDelete: "cascade" }),
+    role: text("role", { enum: ["owner", "maintainer", "viewer"] }).notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.projectId, table.principalId] }),
+    index("project_memberships_principal_idx").on(table.principalId, table.projectId),
   ],
 );
 
@@ -317,6 +360,20 @@ export const evaluations = sqliteTable(
     createdAt: text("created_at").notNull(),
   },
   (table) => [index("evaluations_run_created_idx").on(table.runId, table.createdAt)],
+);
+
+export const runOwners = sqliteTable(
+  "run_owners",
+  {
+    runId: text("run_id")
+      .primaryKey()
+      .references(() => executionRuns.id, { onDelete: "restrict" }),
+    principalId: text("principal_id")
+      .notNull()
+      .references(() => principals.id, { onDelete: "restrict" }),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => [index("run_owners_principal_idx").on(table.principalId, table.runId)],
 );
 
 export const projectsRelations = relations(projects, ({ many }) => ({
