@@ -107,7 +107,7 @@ suite("Docker runtime against a real daemon", () => {
       expect(inspected.HostConfig.PidsLimit).toBe(128);
       expect(inspected.HostConfig.Memory).toBe(2 * 1024 * 1024 * 1024);
       expect(inspected.HostConfig.NanoCpus).toBe(2_000_000_000);
-      expect(inspected.HostConfig.Tmpfs["/tmp"]).toContain("size=268435456");
+      expect(inspected.HostConfig.Tmpfs["/tmp"]).toContain("size=256m");
       expect(inspected.Config.Env).toContain("HOME=/tmp");
       expect(
         inspected.Config.Env.some((item) => item.startsWith("OPENCODE_SERVER_PASSWORD=")),
@@ -172,13 +172,10 @@ suite("Docker runtime against a real daemon", () => {
         docker("exec", currentId, "cat", join(old.workspacePath, "README.md")),
       ).rejects.toThrow();
       await runtime!.recover(runId, repository, old.workspacePath, 2);
-      const oldState = JSON.parse(await docker("inspect", oldId))[0] as {
-        State: { Running: boolean };
-      };
+      await expect(docker("inspect", oldId)).rejects.toThrow();
       const currentState = JSON.parse(await docker("inspect", currentId))[0] as {
         State: { Running: boolean };
       };
-      expect(oldState.State.Running).toBe(false);
       expect(currentState.State.Running).toBe(true);
       await expect(docker("network", "inspect", `agentos-${runId}-2`)).rejects.toThrow();
       await expect(docker("network", "inspect", `agentos-${runId}-3`)).resolves.toBeTruthy();
