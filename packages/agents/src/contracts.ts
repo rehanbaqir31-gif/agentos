@@ -49,7 +49,7 @@ export interface AgentSession {
   runtimeConfiguration: RunManifest["runtimeConfiguration"];
 }
 export interface AgentResult {
-  status: "succeeded" | "failed" | "cancelled";
+  status: "succeeded" | "failed" | "cancelled" | "timed_out" | "incomplete";
   summary: string | null;
   changedFiles: string[];
   diff: string | null;

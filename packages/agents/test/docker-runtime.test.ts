@@ -50,6 +50,8 @@ describe("Docker isolated runtime", () => {
       const allocation = await runtime.allocate(config, "018f86a6-19fd-7ac2-bd82-fd9637e1fb72");
       const args = calls.find(({ args: called }) => called[0] === "run")?.args ?? [];
       expect(args).toContain("--network=agentos-018f86a6-19fd-7ac2-bd82-fd9637e1fb72-1");
+      expect(args).toContain("--entrypoint=opencode");
+      expect(args[args.indexOf(image) + 1]).toBe("serve");
       expect(
         calls.some(
           ({ args: called }) =>
@@ -111,6 +113,22 @@ describe("Docker isolated runtime", () => {
 
   it("requires a sha256-pinned image", () => {
     expect(() => new DockerIsolatedRuntime({ image: "latest" })).toThrow();
+  });
+
+  it("probes the image executable through its entrypoint without duplicating the binary name", async () => {
+    const calls: string[][] = [];
+    const runtime = new DockerIsolatedRuntime({
+      image,
+      commandRunner: {
+        async run(args) {
+          calls.push(args);
+          return "opencode 1.19.5";
+        },
+      },
+    });
+    await expect(runtime.detect()).resolves.toEqual({ installed: true, version: "1.19.5" });
+    expect(calls[0]).toContain("--entrypoint=opencode");
+    expect(calls[0]?.[calls[0]!.indexOf(image) + 1]).toBe("--version");
   });
 
   it("retains the worktree if Docker cannot confirm container termination", async () => {

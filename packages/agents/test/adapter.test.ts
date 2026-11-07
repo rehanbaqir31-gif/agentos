@@ -41,6 +41,20 @@ const runtime = {
   })),
 };
 
+async function createPromptFixture(
+  prompt: (options: { signal?: AbortSignal }) => Promise<unknown>,
+) {
+  const sdk = {
+    session: {
+      create: vi.fn(async () => ({ data: { id: "prompt-session" } })),
+      prompt: vi.fn(prompt),
+    },
+  } as unknown as OpencodeClient;
+  const adapter = new OpenCodeAdapter(runtime, { version: async () => "1.2.0" }, () => sdk);
+  const session = await adapter.initializeSession(config, "prompt-run");
+  return { adapter, session, sdk };
+}
+
 describe("OpenCode adapter", () => {
   it("parses CLI version output and rejects unsupported majors", async () => {
     expect(parseOpenCodeVersion("1.2.3 (opencode)")).toBe("1.2.3");
@@ -118,7 +132,7 @@ describe("OpenCode adapter", () => {
         create: vi.fn(async () => ({ data: { id: "session-a" } })),
         prompt: vi.fn(async () => ({
           data: {
-            info: { time: { completed: 1 } },
+            info: { role: "assistant", sessionID: "session-a", time: { completed: 1 } },
             parts: [
               { type: "reasoning", text: "private reasoning" },
               { type: "text", text: "The README explains the repository." },
@@ -148,6 +162,171 @@ describe("OpenCode adapter", () => {
     );
   });
 
+  it("accepts an empty assistant text when completion is confirmed", async () => {
+    const { adapter, session } = await createPromptFixture(async () => ({
+      data: {
+        info: { role: "assistant", sessionID: "prompt-session", time: { completed: 1 } },
+        parts: [],
+      },
+    }));
+    try {
+      const result = await adapter.execute(
+        config,
+        session,
+        "Inspect",
+        new AbortController().signal,
+      );
+      expect(result).toMatchObject({ status: "succeeded", summary: null });
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  it("returns incomplete when assistant completion metadata is missing", async () => {
+    const { adapter, session } = await createPromptFixture(async () => ({
+      data: {
+        info: { role: "assistant", sessionID: "prompt-session", time: {} },
+        parts: [{ type: "text", text: "partial answer" }],
+      },
+    }));
+    try {
+      const result = await adapter.execute(
+        config,
+        session,
+        "Inspect",
+        new AbortController().signal,
+      );
+      expect(result).toMatchObject({ status: "incomplete", summary: null });
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  it("returns incomplete when the SDK response has no assistant metadata", async () => {
+    const { adapter, session } = await createPromptFixture(async () => ({ data: undefined }));
+    try {
+      const result = await adapter.execute(
+        config,
+        session,
+        "Inspect",
+        new AbortController().signal,
+      );
+      expect(result.status).toBe("incomplete");
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  it("does not accept completion metadata for a different session", async () => {
+    const { adapter, session } = await createPromptFixture(async () => ({
+      data: {
+        info: { role: "assistant", sessionID: "unrelated-session", time: { completed: 1 } },
+        parts: [{ type: "text", text: "unrelated response" }],
+      },
+    }));
+    try {
+      const result = await adapter.execute(
+        config,
+        session,
+        "Inspect",
+        new AbortController().signal,
+      );
+      expect(result).toMatchObject({ status: "incomplete", summary: null });
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  it("classifies typed provider errors as failures and normalizes failed session events", async () => {
+    const { adapter, session } = await createPromptFixture(async () => ({
+      data: {
+        info: {
+          role: "assistant",
+          sessionID: "prompt-session",
+          time: { completed: 1 },
+          error: { name: "ProviderAuthError", data: { message: "private provider details" } },
+        },
+        parts: [],
+      },
+    }));
+    try {
+      const result = await adapter.execute(
+        config,
+        session,
+        "Inspect",
+        new AbortController().signal,
+      );
+      expect(result).toMatchObject({ status: "failed", summary: null });
+      expect(result.terminationReason).toContain("ProviderAuthError");
+      expect(result.terminationReason).not.toContain("private provider details");
+    } finally {
+      await adapter.dispose();
+    }
+    expect(
+      normalizeOpenCodeEvent(
+        { type: "session.error", properties: { sessionID: "s1", error: { name: "ApiError" } } },
+        "now",
+      ),
+    ).toMatchObject({ type: "run.failed", sessionId: "s1" });
+  });
+
+  it("returns failed when the SDK prompt request is interrupted by a non-abort error", async () => {
+    const { adapter, session } = await createPromptFixture(async () => {
+      throw new Error("socket reset");
+    });
+    try {
+      const result = await adapter.execute(
+        config,
+        session,
+        "Inspect",
+        new AbortController().signal,
+      );
+      expect(result).toMatchObject({ status: "failed", summary: null });
+      expect(result.terminationReason).toBe("OpenCode prompt request failed (Error)");
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  it("returns cancelled when the caller aborts the prompt", async () => {
+    const { adapter, session } = await createPromptFixture(({ signal }) => {
+      return new Promise((_resolve, reject) => {
+        if (signal?.aborted) reject(signal.reason);
+        else signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    });
+    const controller = new AbortController();
+    controller.abort(new Error("caller cancelled"));
+    try {
+      const result = await adapter.execute(config, session, "Inspect", controller.signal);
+      expect(result).toMatchObject({ status: "cancelled", summary: null });
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  it("returns timed_out when the configured prompt timeout expires", async () => {
+    const { adapter, session } = await createPromptFixture(({ signal }) => {
+      return new Promise((_resolve, reject) => {
+        if (signal?.aborted) reject(signal.reason);
+        else signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    });
+    const allocation = await runtime.allocate.mock.results.at(-1)?.value;
+    try {
+      const result = await adapter.execute(
+        { ...config, timeoutSeconds: 1 },
+        session,
+        "Inspect",
+        new AbortController().signal,
+      );
+      expect(result).toMatchObject({ status: "timed_out", summary: null });
+      expect(allocation?.cancel).toHaveBeenCalledOnce();
+    } finally {
+      await adapter.dispose();
+    }
+  }, 3_000);
+
   it("performs session and prompt requests through the official SDK against an API double", async () => {
     const paths: string[] = [];
     const server = createServer((request, response) => {
@@ -168,7 +347,16 @@ describe("OpenCode adapter", () => {
         request.method === "POST" &&
         request.url?.startsWith("/session/sdk-session/message?")
       ) {
-        response.end(JSON.stringify({ info: { time: { completed: 2 } }, parts: [] }));
+        response.end(
+          JSON.stringify({
+            info: {
+              role: "assistant",
+              sessionID: "sdk-session",
+              time: { completed: 2 },
+            },
+            parts: [],
+          }),
+        );
       } else {
         response.statusCode = 404;
         response.end(JSON.stringify({ error: "not found" }));

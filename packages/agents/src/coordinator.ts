@@ -460,7 +460,7 @@ export class ExecutionCoordinator {
         await adapter.closeSession(config, session).catch(() => undefined);
         sessionClosed = true;
       }
-      const message = safeMessage(error);
+      const message = result?.terminationReason ?? safeMessage(error);
       const current = await this.repositories.runs.getById(run.id);
       if (!isTerminal(current.status)) {
         const status =
@@ -486,17 +486,24 @@ export class ExecutionCoordinator {
             undefined,
             identity,
           );
-        else
+        else {
+          const code =
+            result?.status === "timed_out"
+              ? "EXECUTION_TIMED_OUT"
+              : result?.status === "incomplete"
+                ? "EXECUTION_INCOMPLETE"
+                : "EXECUTION_FAILED";
           await this.append(
             {
               runId: run.id,
               type: "run.failed",
               occurredAt: this.now(),
-              data: { code: "EXECUTION_FAILED", message },
+              data: { code, message },
             },
             undefined,
             identity,
           );
+        }
       }
       return { run, result, error: message };
     } finally {

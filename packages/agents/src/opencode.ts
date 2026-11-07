@@ -56,6 +56,7 @@ export function normalizeOpenCodeEvent(
     "session.execution.succeeded": "run.completed",
     "session.execution.failed": "run.failed",
     "session.next.step.failed": "run.failed",
+    "session.error": "run.failed",
   };
   const basic = eventTypes[event.type];
   if (basic && sessionId)
@@ -336,13 +337,45 @@ export class OpenCodeAdapter implements AgentAdapter {
         signal: combined,
       });
     } catch (error) {
-      if (combined.aborted) await this.runtimes.get(session.runId)?.cancel();
-      throw error;
+      if (signal.aborted) {
+        await this.runtimes
+          .get(session.runId)
+          ?.cancel()
+          .catch(() => undefined);
+        return incompleteResult(
+          "cancelled",
+          "OpenCode prompt was cancelled before a final response was received",
+        );
+      }
+      if (timeout.aborted) {
+        await this.runtimes
+          .get(session.runId)
+          ?.cancel()
+          .catch(() => undefined);
+        return incompleteResult("timed_out", "OpenCode prompt timed out before completion");
+      }
+      return incompleteResult("failed", safePromptFailure(error));
     }
-    const info = response.data?.info as { time?: { completed?: number } } | undefined;
+    const info = response.data?.info;
+    if (!info) return incompleteResult("incomplete", "OpenCode returned no assistant response");
+    if (info.role !== "assistant" || info.sessionID !== session.id)
+      return incompleteResult(
+        "incomplete",
+        "OpenCode response did not confirm the expected assistant session",
+      );
+    if (info.error) {
+      if (info.error.name === "MessageAbortedError")
+        return incompleteResult("cancelled", "OpenCode reported that the prompt was aborted");
+      return incompleteResult(
+        "failed",
+        `OpenCode assistant response reported ${safeErrorName(info.error.name)}`,
+      );
+    }
+    if (typeof info.time.completed !== "number" || !Number.isFinite(info.time.completed))
+      return incompleteResult("incomplete", "OpenCode response did not confirm completion");
     return {
       status: "succeeded",
-      summary: info?.time?.completed ? extractOpenCodeFinalText(response.data?.parts) : null,
+      summary: extractOpenCodeFinalText(response.data?.parts),
       changedFiles: [],
       diff: null,
       fileHashes: {},
@@ -424,4 +457,34 @@ export class OpenCodeAdapter implements AgentAdapter {
     await Promise.all(allocated.map((runtime) => runtime.dispose()));
     this.sessions.clear();
   }
+}
+
+function incompleteResult(
+  status: Extract<AgentResult["status"], "cancelled" | "failed" | "incomplete" | "timed_out">,
+  reason: string,
+): AgentResult {
+  return {
+    status,
+    summary: null,
+    changedFiles: [],
+    diff: null,
+    fileHashes: {},
+    terminationReason: reason,
+  };
+}
+
+function safePromptFailure(error: unknown): string {
+  const name =
+    typeof error === "object" && error !== null && "name" in error && typeof error.name === "string"
+      ? error.name
+      : "request error";
+  return `OpenCode prompt request failed (${safeErrorName(name)})`;
+}
+
+function safeErrorName(name: string): string {
+  return (
+    redactEventSecrets(name)
+      .replace(/[^a-zA-Z0-9_.-]/g, "")
+      .slice(0, 64) || "UnknownError"
+  );
 }

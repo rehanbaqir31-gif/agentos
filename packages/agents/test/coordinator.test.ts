@@ -3,7 +3,12 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import type { AgentAdapter, AgentSession, NormalizedAgentEvent } from "../src/contracts.js";
+import type {
+  AgentAdapter,
+  AgentResult,
+  AgentSession,
+  NormalizedAgentEvent,
+} from "../src/contracts.js";
 import { adapterConfigSchema } from "../src/contracts.js";
 import { ExecutionCoordinator } from "../src/coordinator.js";
 import { AdapterRegistry } from "../src/registry.js";
@@ -24,6 +29,7 @@ function makeAdapter(
     fail?: boolean;
     events?: NormalizedAgentEvent[];
     testResults?: Record<string, unknown>;
+    resultStatus?: AgentResult["status"];
   } = {},
 ) {
   const calls = { execute: 0, cancel: 0, closed: 0, permissions: [] as string[] };
@@ -78,13 +84,16 @@ function makeAdapter(
       if (signal.aborted) throw new Error("cancelled");
       if (options.fail) throw new Error("execution failed");
       return {
-        status: "succeeded",
+        status: options.resultStatus ?? "succeeded",
         summary: "done",
         changedFiles: [],
         diff: null,
         fileHashes: {},
         stdout: "stdout token=sk-abcdefghijklmnopqrstuvwxyz123456",
         stderr: "stderr warning",
+        ...(options.resultStatus && options.resultStatus !== "succeeded"
+          ? { terminationReason: `OpenCode ${options.resultStatus}` }
+          : {}),
         ...(options.testResults ? { testResults: options.testResults } : {}),
       };
     },
@@ -449,6 +458,33 @@ describe("durable execution coordinator", () => {
       });
       expect(outcome.run.status).toBe("failed");
       expect(outcome.error).toBe("execution failed");
+    } finally {
+      f.database.close();
+      await rm(f.directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["timed_out", "EXECUTION_TIMED_OUT"],
+    ["incomplete", "EXECUTION_INCOMPLETE"],
+  ] as const)("preserves the %s outcome while failing the run", async (resultStatus, code) => {
+    const f = await fixture();
+    const runId = randomUUID();
+    try {
+      const outcome = await coordinatorFor(f, makeAdapter({ resultStatus }).adapter).startTask({
+        taskId: f.task.id,
+        agentId: f.agent.id,
+        runId,
+      });
+      expect(outcome.run.status).toBe("failed");
+      expect(outcome.result?.status).toBe(resultStatus);
+      const events = await f.repositories.events.list({ runId, limit: 100 });
+      expect(events.items.find((event) => event.type === "run.failed")?.data).toMatchObject({
+        code,
+      });
+      const artifacts = await f.repositories.artifacts.listForProject(runId, f.project.id);
+      const metadata = artifacts.items.find((artifact) => artifact.type === "result_metadata");
+      expect(metadata).toBeDefined();
     } finally {
       f.database.close();
       await rm(f.directory, { recursive: true, force: true });
