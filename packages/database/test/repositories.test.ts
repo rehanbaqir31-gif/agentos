@@ -93,11 +93,11 @@ describe("SQLite database and repositories", () => {
   it("initializes versioned schema and applies migrations only once", () => {
     expect(database.sqlite.pragma("foreign_keys", { simple: true })).toBe(1);
     expect(database.sqlite.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({
-      n: 2,
+      n: 3,
     });
     applyMigrations(database.sqlite, migrations);
     expect(database.sqlite.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({
-      n: 2,
+      n: 3,
     });
     expect(() =>
       applyMigrations(database.sqlite, [
@@ -107,6 +107,7 @@ describe("SQLite database and repositories", () => {
   });
 
   it("rolls back the additive approval migration only when no approval audit fields are populated", async () => {
+    expect(rollbackLastMigration(database.sqlite)).toBe(3);
     expect(rollbackLastMigration(database.sqlite)).toBe(2);
     expect(database.sqlite.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({
       n: 1,
@@ -126,6 +127,7 @@ describe("SQLite database and repositories", () => {
       policyVersion: "policy-v1",
       expiresAt: "2026-11-05T13:00:00.000Z",
     });
+    expect(rollbackLastMigration(database.sqlite)).toBe(3);
     expect(() => rollbackLastMigration(database.sqlite)).toThrow(/discard approval audit state/);
     expect(database.sqlite.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({
       n: 2,

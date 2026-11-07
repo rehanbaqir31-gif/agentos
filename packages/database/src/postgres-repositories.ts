@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, count, desc, eq, gt, ilike, isNull, sql } from "drizzle-orm";
+import { and, count, desc, eq, gt, ilike, isNotNull, isNull, lt, sql } from "drizzle-orm";
 import type {
   Agent,
   AgentEvent,
@@ -18,6 +18,8 @@ import type {
   Project,
   Provider,
   RunManifest,
+  RunArtifact,
+  CreateRunArtifact,
   Task,
   RepositorySet,
   EventFilter,
@@ -39,6 +41,7 @@ import {
   createProjectSchema,
   createProviderSchema,
   createRunManifestSchema,
+  createRunArtifactSchema,
   createTaskSchema,
   evaluationSchema,
   executionRunSchema,
@@ -46,6 +49,7 @@ import {
   providerSchema,
   redactEventSecrets,
   runManifestSchema,
+  runArtifactSchema,
   taskSchema,
   transitionRun,
 } from "@agentos/core";
@@ -60,6 +64,7 @@ import {
   pgProviders,
   pgRunEventCounters,
   pgRunManifests,
+  pgRunArtifacts,
   pgTasks,
 } from "./postgres-schema.js";
 import {
@@ -641,6 +646,123 @@ export class PostgresRunManifestRepository {
   }
 }
 
+export class PostgresRunArtifactRepository {
+  constructor(private readonly database: AgentOsPostgresDatabase) {}
+
+  async create(input: CreateRunArtifact, id = randomUUID()): Promise<RunArtifact> {
+    const value = runArtifactSchema.parse({
+      ...createRunArtifactSchema.parse(input),
+      id,
+      createdAt: this.database.now(),
+    });
+    const run = await this.database.orm
+      .select({ id: pgExecutionRuns.id, projectId: pgExecutionRuns.projectId })
+      .from(pgExecutionRuns)
+      .where(eq(pgExecutionRuns.id, assertId(value.runId)))
+      .limit(1);
+    if (!run[0] || run[0].projectId !== value.projectId)
+      throw new RelationshipValidationError("Artifact run must belong to its project");
+    try {
+      await this.database.orm.insert(pgRunArtifacts).values(value);
+      return this.getForProject(value.runId, value.projectId, value.id);
+    } catch (error) {
+      return translateError(error);
+    }
+  }
+
+  async getForProject(runId: string, projectId: string, artifactId: string): Promise<RunArtifact> {
+    const rows = await this.database.orm
+      .select()
+      .from(pgRunArtifacts)
+      .where(
+        and(
+          eq(pgRunArtifacts.runId, assertId(runId)),
+          eq(pgRunArtifacts.projectId, assertId(projectId)),
+          eq(pgRunArtifacts.id, assertId(artifactId)),
+        ),
+      )
+      .limit(1);
+    return runArtifactSchema.parse(one(rows, "Run artifact", artifactId));
+  }
+
+  async listForProject(
+    runId: string,
+    projectId: string,
+    input: PageRequest = {},
+  ): Promise<Page<RunArtifact>> {
+    const { limit, offset } = pageRequest(input);
+    const condition = and(
+      eq(pgRunArtifacts.runId, assertId(runId)),
+      eq(pgRunArtifacts.projectId, assertId(projectId)),
+    );
+    const [rows, totalRow] = await Promise.all([
+      this.database.orm
+        .select()
+        .from(pgRunArtifacts)
+        .where(condition)
+        .orderBy(desc(pgRunArtifacts.createdAt), desc(pgRunArtifacts.id))
+        .limit(limit)
+        .offset(offset),
+      this.database.orm.select({ value: count() }).from(pgRunArtifacts).where(condition),
+    ]);
+    return page(
+      rows.map((row) => runArtifactSchema.parse(normalizeTimestamps(row))),
+      totalRow[0]?.value ?? 0,
+      input,
+    );
+  }
+
+  async totalBytes(runId: string, projectId: string): Promise<number> {
+    const rows = await this.database.orm
+      .select({ value: sql<number>`coalesce(sum(${pgRunArtifacts.byteSize}), 0)::float8` })
+      .from(pgRunArtifacts)
+      .where(
+        and(
+          eq(pgRunArtifacts.runId, assertId(runId)),
+          eq(pgRunArtifacts.projectId, assertId(projectId)),
+          isNotNull(pgRunArtifacts.storageLocator),
+        ),
+      );
+    return Number(rows[0]?.value ?? 0);
+  }
+
+  async listStorageLocators(): Promise<string[]> {
+    const rows = await this.database.orm
+      .select({ locator: pgRunArtifacts.storageLocator })
+      .from(pgRunArtifacts)
+      .where(isNotNull(pgRunArtifacts.storageLocator));
+    return rows.flatMap((row) => (row.locator ? [row.locator] : []));
+  }
+
+  async listExpired(before: string, input: PageRequest = {}): Promise<Page<RunArtifact>> {
+    const { limit, offset } = pageRequest(input);
+    const condition = lt(pgRunArtifacts.createdAt, before);
+    const [rows, totalRow] = await Promise.all([
+      this.database.orm
+        .select()
+        .from(pgRunArtifacts)
+        .where(condition)
+        .orderBy(pgRunArtifacts.createdAt, pgRunArtifacts.id)
+        .limit(limit)
+        .offset(offset),
+      this.database.orm.select({ value: count() }).from(pgRunArtifacts).where(condition),
+    ]);
+    return page(
+      rows.map((row) => runArtifactSchema.parse(normalizeTimestamps(row))),
+      totalRow[0]?.value ?? 0,
+      input,
+    );
+  }
+
+  async delete(id: string): Promise<RunArtifact | null> {
+    const rows = await this.database.orm
+      .delete(pgRunArtifacts)
+      .where(eq(pgRunArtifacts.id, assertId(id)))
+      .returning();
+    return rows[0] ? runArtifactSchema.parse(normalizeTimestamps(rows[0])) : null;
+  }
+}
+
 export class PostgresAgentEventRepository {
   constructor(private readonly database: AgentOsPostgresDatabase) {}
   async append(input: CreateAgentEvent, id = randomUUID()): Promise<AgentEvent> {
@@ -913,6 +1035,7 @@ export class PostgresRepositories implements RepositorySet {
   readonly tasks: PostgresTaskRepository;
   readonly runs: PostgresExecutionRunRepository;
   readonly manifests: PostgresRunManifestRepository;
+  readonly artifacts: PostgresRunArtifactRepository;
   readonly events: PostgresAgentEventRepository;
   readonly approvals: PostgresApprovalRepository;
   readonly evaluations: PostgresEvaluationRepository;
@@ -924,6 +1047,7 @@ export class PostgresRepositories implements RepositorySet {
     this.tasks = new PostgresTaskRepository(database);
     this.runs = new PostgresExecutionRunRepository(database);
     this.manifests = new PostgresRunManifestRepository(database);
+    this.artifacts = new PostgresRunArtifactRepository(database);
     this.events = new PostgresAgentEventRepository(database);
     this.approvals = new PostgresApprovalRepository(database);
     this.evaluations = new PostgresEvaluationRepository(database);

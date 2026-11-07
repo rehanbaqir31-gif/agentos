@@ -5,3 +5,5 @@ export * from "./git-workspace.js";
 export * from "./docker-runtime.js";
 export * from "./coordinator.js";
 export * from "./approval-policy.js";
+export * from "./artifact-storage.js";
+export * from "./artifact-service.js";

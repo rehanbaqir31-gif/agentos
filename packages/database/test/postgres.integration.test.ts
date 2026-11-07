@@ -131,7 +131,7 @@ describe(`PostgreSQL persistence (${testMode})`, () => {
     const rows = await database.pool.query(
       "SELECT version FROM schema_migrations ORDER BY version",
     );
-    expect(rows.rows).toEqual([{ version: 1 }, { version: 2 }]);
+    expect(rows.rows).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
     await expect(
       applyPostgresMigrations(database.pool, [
         { ...postgresMigrations[0]!, sql: `${postgresMigrations[0]!.sql}\n-- changed` },
@@ -140,6 +140,7 @@ describe(`PostgreSQL persistence (${testMode})`, () => {
   });
 
   it("reverses the additive approval migration only before approval audit data is written", async () => {
+    expect(await rollbackLastPostgresMigration(database.pool)).toBe(3);
     expect(await rollbackLastPostgresMigration(database.pool)).toBe(2);
     const remaining = await database.pool.query(
       "SELECT version FROM schema_migrations ORDER BY version",
@@ -160,6 +161,7 @@ describe(`PostgreSQL persistence (${testMode})`, () => {
       policyVersion: "policy-v1",
       expiresAt: "2026-11-05T13:00:00.000Z",
     });
+    expect(await rollbackLastPostgresMigration(database.pool)).toBe(3);
     await expect(rollbackLastPostgresMigration(database.pool)).rejects.toThrow(
       /discard approval audit state/,
     );
@@ -223,6 +225,98 @@ describe(`PostgreSQL persistence (${testMode})`, () => {
       ]),
     ).rejects.toMatchObject({ code: "23503" });
     await expect(repositories.runs.update(fixture.run.id, { modelId: "other" })).rejects.toThrow();
+  });
+
+  it("persists scoped result artifacts, validates relationships, and paginates metadata", async () => {
+    const fixture = await createFixture();
+    const diffId = randomUUID();
+    const stdoutId = randomUUID();
+    const diff = await repositories.artifacts.create(
+      {
+        runId: fixture.run.id,
+        projectId: fixture.project.id,
+        type: "git_diff",
+        logicalName: "patch.diff",
+        contentType: "text/x-diff",
+        byteSize: 128,
+        sha256: "a".repeat(64),
+        storageLocator: `${diffId.slice(0, 2)}/${diffId}.artifact`,
+        collectionStatus: "complete",
+        collectionError: null,
+      },
+      diffId,
+    );
+    const stdout = await repositories.artifacts.create(
+      {
+        runId: fixture.run.id,
+        projectId: fixture.project.id,
+        type: "stdout",
+        logicalName: "stdout.txt",
+        contentType: "text/plain; charset=utf-8",
+        byteSize: 0,
+        sha256: null,
+        storageLocator: null,
+        collectionStatus: "unavailable",
+        collectionError: "Adapter did not expose process stdout",
+      },
+      stdoutId,
+    );
+    expect(
+      await repositories.artifacts.getForProject(fixture.run.id, fixture.project.id, diffId),
+    ).toEqual(diff);
+    expect(
+      (
+        await repositories.artifacts.listForProject(fixture.run.id, fixture.project.id, {
+          limit: 1,
+        })
+      ).total,
+    ).toBe(2);
+    expect(
+      (
+        await repositories.artifacts.listForProject(fixture.run.id, fixture.project.id, {
+          limit: 1,
+        })
+      ).items,
+    ).toHaveLength(1);
+    expect(await repositories.artifacts.totalBytes(fixture.run.id, fixture.project.id)).toBe(128);
+    expect(await repositories.artifacts.listStorageLocators()).toContain(diff.storageLocator);
+    expect(
+      await repositories.artifacts.getForProject(fixture.run.id, fixture.project.id, stdout.id),
+    ).toEqual(stdout);
+    await expect(
+      repositories.artifacts.getForProject(fixture.run.id, randomUUID(), diffId),
+    ).rejects.toThrow("not found");
+    await expect(
+      repositories.artifacts.create({
+        runId: fixture.run.id,
+        projectId: randomUUID(),
+        type: "stdout",
+        logicalName: "wrong-project.txt",
+        contentType: "text/plain",
+        byteSize: 0,
+        sha256: null,
+        storageLocator: null,
+        collectionStatus: "unavailable",
+        collectionError: "Unavailable",
+      }),
+    ).rejects.toThrow("must belong to its project");
+    await expect(
+      repositories.artifacts.create(
+        {
+          runId: fixture.run.id,
+          projectId: fixture.project.id,
+          type: "git_diff",
+          logicalName: "patch.diff",
+          contentType: "text/x-diff",
+          byteSize: 1,
+          sha256: "b".repeat(64),
+          storageLocator: `${diffId.slice(0, 2)}/${diffId}.artifact`,
+          collectionStatus: "complete",
+          collectionError: null,
+        },
+        diffId,
+      ),
+    ).rejects.toBeInstanceOf(RepositoryConflictError);
   });
 
   it("stores normalized events in order, redacts secrets, and filters by sequence", async () => {

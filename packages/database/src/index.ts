@@ -37,6 +37,7 @@ export {
   PostgresProviderRepository,
   PostgresRepositories,
   PostgresRunManifestRepository,
+  PostgresRunArtifactRepository,
   PostgresTaskRepository,
 } from "./postgres-repositories.js";
 export {
@@ -53,6 +54,7 @@ export {
   RepositoryConflictError,
   RepositoryNotFoundError,
   RunManifestRepository,
+  RunArtifactRepository,
   TaskRepository,
   type EventFilter,
   type Page,

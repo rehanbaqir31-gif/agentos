@@ -1,5 +1,13 @@
 import { relations, sql } from "drizzle-orm";
-import { check, index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import {
+  check,
+  foreignKey,
+  index,
+  integer,
+  sqliteTable,
+  text,
+  uniqueIndex,
+} from "drizzle-orm/sqlite-core";
 import type {
   Agent,
   Approval,
@@ -141,6 +149,7 @@ export const executionRuns = sqliteTable(
     ),
     index("execution_runs_project_created_idx").on(table.projectId, table.createdAt),
     index("execution_runs_task_idx").on(table.taskId),
+    uniqueIndex("execution_runs_id_project_id_uq").on(table.id, table.projectId),
   ],
 );
 
@@ -197,6 +206,50 @@ export const agentEvents = sqliteTable(
   (table) => [
     uniqueIndex("agent_events_run_sequence_uq").on(table.runId, table.sequence),
     index("agent_events_run_time_idx").on(table.runId, table.occurredAt),
+  ],
+);
+
+export const runArtifacts = sqliteTable(
+  "run_artifacts",
+  {
+    id: text("id").primaryKey(),
+    runId: text("run_id").notNull(),
+    projectId: text("project_id").notNull(),
+    type: text("artifact_type", {
+      enum: [
+        "git_diff",
+        "stdout",
+        "stderr",
+        "test_results",
+        "execution_manifest",
+        "result_metadata",
+      ],
+    }).notNull(),
+    logicalName: text("logical_name").notNull(),
+    contentType: text("content_type").notNull(),
+    byteSize: integer("byte_size").notNull(),
+    sha256: text("sha256"),
+    createdAt: text("created_at").notNull(),
+    storageLocator: text("storage_locator"),
+    collectionStatus: text("collection_status", {
+      enum: ["complete", "truncated", "failed", "unavailable"],
+    }).notNull(),
+    collectionError: text("collection_error"),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.runId, table.projectId],
+      foreignColumns: [executionRuns.id, executionRuns.projectId],
+      name: "run_artifacts_run_project_fk",
+    }).onDelete("restrict"),
+    check("run_artifacts_byte_size_check", sql`${table.byteSize} >= 0`),
+    check(
+      "run_artifacts_integrity_check",
+      sql`(${table.collectionStatus} IN ('complete', 'truncated') AND ${table.storageLocator} IS NOT NULL AND ${table.sha256} IS NOT NULL AND ${table.collectionError} IS NULL) OR (${table.collectionStatus} = 'failed' AND ${table.storageLocator} IS NULL AND ${table.collectionError} IS NOT NULL) OR (${table.collectionStatus} = 'unavailable' AND ${table.byteSize} = 0 AND ${table.sha256} IS NULL AND ${table.storageLocator} IS NULL AND ${table.collectionError} IS NOT NULL)`,
+    ),
+    uniqueIndex("run_artifacts_run_type_name_uq").on(table.runId, table.type, table.logicalName),
+    index("run_artifacts_run_created_idx").on(table.runId, table.createdAt, table.id),
+    index("run_artifacts_project_created_idx").on(table.projectId, table.createdAt, table.id),
   ],
 );
 
@@ -271,6 +324,7 @@ export const executionRunsRelations = relations(executionRuns, ({ one, many }) =
   }),
   events: many(agentEvents),
   approvals: many(approvals),
+  artifacts: many(runArtifacts),
   evaluations: many(evaluations),
 }));
 export const runManifestsRelations = relations(runManifests, ({ one }) => ({
@@ -278,6 +332,12 @@ export const runManifestsRelations = relations(runManifests, ({ one }) => ({
 }));
 export const agentEventsRelations = relations(agentEvents, ({ one }) => ({
   run: one(executionRuns, { fields: [agentEvents.runId], references: [executionRuns.id] }),
+}));
+export const runArtifactsRelations = relations(runArtifacts, ({ one }) => ({
+  run: one(executionRuns, {
+    fields: [runArtifacts.runId],
+    references: [executionRuns.id],
+  }),
 }));
 export const approvalsRelations = relations(approvals, ({ one }) => ({
   run: one(executionRuns, { fields: [approvals.runId], references: [executionRuns.id] }),

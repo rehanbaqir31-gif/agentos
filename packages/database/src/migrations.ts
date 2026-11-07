@@ -174,4 +174,35 @@ ALTER TABLE approvals DROP COLUMN principal_id;
 `,
     rollbackCheckSql: `SELECT COUNT(*) AS count FROM approvals WHERE principal_id IS NOT NULL OR policy_version IS NOT NULL OR expires_at IS NOT NULL OR consumed_at IS NOT NULL OR revoked_at IS NOT NULL`,
   },
+  {
+    version: 3,
+    name: "run_artifact_metadata",
+    sql: `
+CREATE UNIQUE INDEX execution_runs_id_project_id_uq ON execution_runs(id, project_id);
+CREATE TABLE run_artifacts (
+  id TEXT PRIMARY KEY NOT NULL,
+  run_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  artifact_type TEXT NOT NULL CHECK (artifact_type IN ('git_diff', 'stdout', 'stderr', 'test_results', 'execution_manifest', 'result_metadata')),
+  logical_name TEXT NOT NULL,
+  content_type TEXT NOT NULL,
+  byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+  sha256 TEXT CHECK (sha256 IS NULL OR (length(sha256) = 64 AND sha256 NOT GLOB '*[^a-fA-F0-9]*')),
+  created_at TEXT NOT NULL,
+  storage_locator TEXT,
+  collection_status TEXT NOT NULL CHECK (collection_status IN ('complete', 'truncated', 'failed', 'unavailable')),
+  collection_error TEXT,
+  UNIQUE (run_id, artifact_type, logical_name),
+  FOREIGN KEY (run_id, project_id) REFERENCES execution_runs(id, project_id) ON DELETE RESTRICT,
+  CHECK ((collection_status IN ('complete', 'truncated') AND storage_locator IS NOT NULL AND sha256 IS NOT NULL AND collection_error IS NULL) OR (collection_status = 'failed' AND storage_locator IS NULL AND collection_error IS NOT NULL) OR (collection_status = 'unavailable' AND byte_size = 0 AND sha256 IS NULL AND storage_locator IS NULL AND collection_error IS NOT NULL))
+);
+CREATE INDEX run_artifacts_run_created_idx ON run_artifacts(run_id, created_at, id);
+CREATE INDEX run_artifacts_project_created_idx ON run_artifacts(project_id, created_at, id);
+`,
+    downSql: `
+DROP TABLE run_artifacts;
+DROP INDEX execution_runs_id_project_id_uq;
+`,
+    rollbackCheckSql: "SELECT COUNT(*) AS count FROM run_artifacts",
+  },
 ];

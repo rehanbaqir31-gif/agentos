@@ -53,6 +53,14 @@ export interface AgentResult {
   changedFiles: string[];
   diff: string | null;
   fileHashes: Record<string, string | null>;
+  /** Adapter-provided process stdout. Null means this adapter/runtime cannot collect it. */
+  stdout?: string | null;
+  /** Adapter-provided process stderr. Null means this adapter/runtime cannot collect it. */
+  stderr?: string | null;
+  exitCode?: number | null;
+  terminationReason?: string | null;
+  testResults?: Record<string, unknown> | null;
+  collectionErrors?: string[];
 }
 export type NormalizedAgentEvent = (
   | {

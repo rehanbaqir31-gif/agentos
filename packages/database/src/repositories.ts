@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, count, desc, eq, gt, isNull, like, max } from "drizzle-orm";
+import { and, count, desc, eq, gt, isNotNull, isNull, like, lt, max, sql } from "drizzle-orm";
 import type {
   Agent,
   Approval,
@@ -17,6 +17,8 @@ import type {
   Project,
   Provider,
   RunManifest,
+  RunArtifact,
+  CreateRunArtifact,
   RepositorySet,
   Task,
 } from "@agentos/core";
@@ -38,6 +40,8 @@ import {
   projectSchema,
   providerSchema,
   runManifestSchema,
+  runArtifactSchema,
+  createRunArtifactSchema,
   taskSchema,
   transitionRun,
   type AgentEvent,
@@ -69,6 +73,7 @@ import {
   projects,
   providers,
   runManifests,
+  runArtifacts,
   tasks,
 } from "./schema.js";
 
@@ -602,6 +607,117 @@ export class AgentEventRepository {
   }
 }
 
+export class RunArtifactRepository {
+  constructor(private readonly database: AgentOsDatabase) {}
+
+  create(input: CreateRunArtifact, id = randomUUID()): RunArtifact {
+    const value = runArtifactSchema.parse({
+      ...createRunArtifactSchema.parse(input),
+      id,
+      createdAt: this.database.now(),
+    });
+    const run = this.database.orm
+      .select({ id: executionRuns.id, projectId: executionRuns.projectId })
+      .from(executionRuns)
+      .where(eq(executionRuns.id, assertId(value.runId)))
+      .get();
+    if (!run || run.projectId !== value.projectId)
+      throw new RelationshipValidationError("Artifact run must belong to its project");
+    try {
+      this.database.orm.insert(runArtifacts).values(value).run();
+      return this.getForProject(value.runId, value.projectId, value.id);
+    } catch (error) {
+      return translateError(error);
+    }
+  }
+
+  getForProject(runId: string, projectId: string, artifactId: string): RunArtifact {
+    const row = this.database.orm
+      .select()
+      .from(runArtifacts)
+      .where(
+        and(
+          eq(runArtifacts.runId, assertId(runId)),
+          eq(runArtifacts.projectId, assertId(projectId)),
+          eq(runArtifacts.id, assertId(artifactId)),
+        ),
+      )
+      .get();
+    if (!row) throw new RepositoryNotFoundError("Run artifact", artifactId);
+    return runArtifactSchema.parse(row);
+  }
+
+  listForProject(runId: string, projectId: string, input: PageRequest = {}): Page<RunArtifact> {
+    const { limit, offset } = pageRequest(input);
+    const condition = and(
+      eq(runArtifacts.runId, assertId(runId)),
+      eq(runArtifacts.projectId, assertId(projectId)),
+    );
+    const rows = this.database.orm
+      .select()
+      .from(runArtifacts)
+      .where(condition)
+      .orderBy(desc(runArtifacts.createdAt), desc(runArtifacts.id))
+      .limit(limit)
+      .offset(offset)
+      .all();
+    const total =
+      this.database.orm.select({ value: count() }).from(runArtifacts).where(condition).get()
+        ?.value ?? 0;
+    return { items: rows.map((row) => runArtifactSchema.parse(row)), total, limit, offset };
+  }
+
+  totalBytes(runId: string, projectId: string): number {
+    const result = this.database.orm
+      .select({ value: sql<number>`coalesce(sum(${runArtifacts.byteSize}), 0)` })
+      .from(runArtifacts)
+      .where(
+        and(
+          eq(runArtifacts.runId, assertId(runId)),
+          eq(runArtifacts.projectId, assertId(projectId)),
+          isNotNull(runArtifacts.storageLocator),
+        ),
+      )
+      .get();
+    return Number(result?.value ?? 0);
+  }
+
+  listStorageLocators(): string[] {
+    return this.database.orm
+      .select({ locator: runArtifacts.storageLocator })
+      .from(runArtifacts)
+      .where(isNotNull(runArtifacts.storageLocator))
+      .all()
+      .flatMap((row) => (row.locator ? [row.locator] : []));
+  }
+
+  listExpired(before: string, input: PageRequest = {}): Page<RunArtifact> {
+    const { limit, offset } = pageRequest(input);
+    const condition = lt(runArtifacts.createdAt, before);
+    const rows = this.database.orm
+      .select()
+      .from(runArtifacts)
+      .where(condition)
+      .orderBy(runArtifacts.createdAt, runArtifacts.id)
+      .limit(limit)
+      .offset(offset)
+      .all();
+    const total =
+      this.database.orm.select({ value: count() }).from(runArtifacts).where(condition).get()
+        ?.value ?? 0;
+    return { items: rows.map((row) => runArtifactSchema.parse(row)), total, limit, offset };
+  }
+
+  delete(id: string): RunArtifact | null {
+    const row = this.database.orm
+      .delete(runArtifacts)
+      .where(eq(runArtifacts.id, assertId(id)))
+      .returning()
+      .get();
+    return row ? runArtifactSchema.parse(row) : null;
+  }
+}
+
 export class ApprovalRepository {
   constructor(private readonly database: AgentOsDatabase) {}
   create(input: CreateApproval, id = randomUUID()): Approval {
@@ -810,6 +926,7 @@ export class Repositories implements RepositorySet {
   readonly tasks: TaskRepository;
   readonly runs: ExecutionRunRepository;
   readonly manifests: RunManifestRepository;
+  readonly artifacts: RunArtifactRepository;
   readonly events: AgentEventRepository;
   readonly approvals: ApprovalRepository;
   readonly evaluations: EvaluationRepository;
@@ -821,6 +938,7 @@ export class Repositories implements RepositorySet {
     this.tasks = new TaskRepository(database);
     this.runs = new ExecutionRunRepository(database);
     this.manifests = new RunManifestRepository(database);
+    this.artifacts = new RunArtifactRepository(database);
     this.events = new AgentEventRepository(database);
     this.approvals = new ApprovalRepository(database);
     this.evaluations = new EvaluationRepository(database);

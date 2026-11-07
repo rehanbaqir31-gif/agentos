@@ -12,6 +12,8 @@ import {
 } from "@agentos/core";
 import { RepositoryConflictError } from "@agentos/database";
 import { AdapterRegistry } from "./registry.js";
+import { ArtifactService } from "./artifact-service.js";
+import type { RunManifest } from "@agentos/core";
 import type {
   AgentAdapter,
   AdapterConfig,
@@ -40,6 +42,7 @@ export class ExecutionCoordinator {
   constructor(
     private readonly repositories: RepositorySet,
     private readonly adapters: AdapterRegistry,
+    private readonly artifacts: ArtifactService,
     private readonly now: () => string = () => new Date().toISOString(),
   ) {}
 
@@ -179,6 +182,8 @@ export class ExecutionCoordinator {
     let streamAbort: AbortController | undefined;
     let streamTask: Promise<void> | undefined;
     let sessionClosed = false;
+    let manifest: RunManifest | undefined;
+    let artifactsCaptured = false;
     const controller = new AbortController();
     const abort = () => controller.abort(signal?.reason);
     signal?.addEventListener("abort", abort, { once: true });
@@ -201,7 +206,7 @@ export class ExecutionCoordinator {
         adapterVersion: session.adapterVersion,
         workspaceId: session.workspacePath,
       });
-      await this.persistManifest(run, task, project, agent, config, session);
+      manifest = await this.persistManifest(run, task, project, agent, config, session);
       await this.append({
         runId: run.id,
         type: "session.attached",
@@ -230,7 +235,7 @@ export class ExecutionCoordinator {
       });
       await streamReady;
       if (streamError) throw streamError;
-      result = await adapter.execute(
+      const executionResult = await adapter.execute(
         config,
         session,
         `${task.title}\n\n${task.description}`,
@@ -240,32 +245,60 @@ export class ExecutionCoordinator {
       await streamTask;
       if (streamError) throw streamError;
       const completedResult = await adapter.collectResults(config, session);
-      result = completedResult;
-      await adapter.closeSession(config, session);
-      sessionClosed = true;
+      const finalResult = mergeResults(
+        executionResult,
+        completedResult,
+        controller.signal.aborted
+          ? "cancelled"
+          : executionResult.status === "succeeded"
+            ? completedResult.status
+            : executionResult.status,
+      );
+      result = finalResult;
+      const captured = await this.artifacts.capture(run.id, project.id, manifest, finalResult);
+      artifactsCaptured = true;
       const diffSha256 =
-        completedResult.diff === null
+        finalResult.diff === null
           ? null
-          : createHash("sha256").update(completedResult.diff).digest("hex");
+          : createHash("sha256").update(finalResult.diff).digest("hex");
       await this.append({
         runId: run.id,
         type: "run.result",
         occurredAt: this.now(),
         data: {
-          summary: completedResult.summary,
+          summary: finalResult.summary,
           diffSha256,
-          files: completedResult.changedFiles.map((path) => ({
+          files: finalResult.changedFiles.map((path) => ({
             path,
-            sha256: completedResult.fileHashes[path] ?? null,
+            sha256: finalResult.fileHashes[path] ?? null,
+          })),
+          artifacts: captured.artifacts.map(({ id, type, collectionStatus, byteSize, sha256 }) => ({
+            id,
+            type,
+            collectionStatus,
+            byteSize,
+            sha256,
           })),
         },
       });
+      if (captured.failures.length)
+        throw new Error(
+          `Required result artifact persistence failed: ${captured.failures.join("; ")}`,
+        );
+      if (controller.signal.aborted)
+        throw new Error(safeMessage(controller.signal.reason ?? "Execution cancelled"));
+      if (finalResult.status !== "succeeded")
+        throw new Error(
+          finalResult.terminationReason ?? "Agent reported an unsuccessful execution result",
+        );
+      await adapter.closeSession(config, session);
+      sessionClosed = true;
       run = await this.transition(run, "succeeded", { completedAt: this.now() });
       await this.append({
         runId: run.id,
         type: "run.completed",
         occurredAt: this.now(),
-        data: { summary: completedResult.summary },
+        data: { summary: finalResult.summary },
       });
       return { run, result, error: null };
     } catch (error) {
@@ -273,13 +306,57 @@ export class ExecutionCoordinator {
       await streamTask?.catch(() => undefined);
       if (session && !sessionClosed) {
         if (controller.signal.aborted) await adapter.cancel(config, session).catch(() => undefined);
+        if (manifest && !artifactsCaptured) {
+          try {
+            const partial = await adapter.collectResults(config, session);
+            result = result
+              ? mergeResults(result, partial, controller.signal.aborted ? "cancelled" : "failed")
+              : { ...partial, status: controller.signal.aborted ? "cancelled" : "failed" };
+            const partialResult = result;
+            const captured = await this.artifacts.capture(
+              run.id,
+              project.id,
+              manifest,
+              partialResult,
+            );
+            artifactsCaptured = true;
+            await this.append({
+              runId: run.id,
+              type: "run.result",
+              occurredAt: this.now(),
+              data: {
+                summary: result.summary,
+                diffSha256:
+                  partialResult.diff === null
+                    ? null
+                    : createHash("sha256").update(partialResult.diff).digest("hex"),
+                files: partialResult.changedFiles.map((path) => ({
+                  path,
+                  sha256: partialResult.fileHashes[path] ?? null,
+                })),
+                artifacts: captured.artifacts.map(
+                  ({ id, type, collectionStatus, byteSize, sha256 }) => ({
+                    id,
+                    type,
+                    collectionStatus,
+                    byteSize,
+                    sha256,
+                  }),
+                ),
+              },
+            });
+          } catch {
+            // Preserve the original run failure; incomplete capture remains visible through absent artifacts.
+          }
+        }
         await adapter.closeSession(config, session).catch(() => undefined);
         sessionClosed = true;
       }
       const message = safeMessage(error);
       const current = await this.repositories.runs.getById(run.id);
       if (!isTerminal(current.status)) {
-        const status = controller.signal.aborted ? "cancelled" : "failed";
+        const status =
+          controller.signal.aborted || result?.status === "cancelled" ? "cancelled" : "failed";
         run = await this.repositories.runs.update(run.id, {
           status,
           completedAt: current.startedAt ? this.now() : null,
@@ -313,7 +390,7 @@ export class ExecutionCoordinator {
     agent: Agent,
     config: AdapterConfig,
     session: AgentSession,
-  ): Promise<void> {
+  ): Promise<RunManifest> {
     const promptConfigurationHash = createHash("sha256")
       .update(
         JSON.stringify({
@@ -327,7 +404,7 @@ export class ExecutionCoordinator {
         }),
       )
       .digest("hex");
-    await this.repositories.manifests.create({
+    return await this.repositories.manifests.create({
       version: 1,
       runId: run.id,
       agentId: agent.id,
@@ -495,6 +572,27 @@ function stableEventId(runId: string, source: string): string {
   bytes[8] = (bytes[8]! & 0x3f) | 0x80;
   const hex = bytes.toString("hex");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function mergeResults(
+  execution: AgentResult,
+  collected: AgentResult,
+  status: AgentResult["status"] = execution.status,
+): AgentResult {
+  return {
+    ...collected,
+    status,
+    summary: execution.summary ?? collected.summary,
+    stdout: execution.stdout ?? collected.stdout ?? null,
+    stderr: execution.stderr ?? collected.stderr ?? null,
+    exitCode: execution.exitCode ?? collected.exitCode ?? null,
+    terminationReason: execution.terminationReason ?? collected.terminationReason ?? null,
+    testResults: execution.testResults ?? collected.testResults ?? null,
+    collectionErrors: [
+      ...(execution.collectionErrors ?? []),
+      ...(collected.collectionErrors ?? []),
+    ],
+  };
 }
 
 function safeMessage(error: unknown): string {

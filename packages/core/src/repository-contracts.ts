@@ -1,6 +1,7 @@
 import type {
   Agent,
   Approval,
+  CreateRunArtifact,
   CreateAgent,
   CreateApproval,
   CreateEvaluation,
@@ -14,6 +15,7 @@ import type {
   Project,
   Provider,
   RunManifest,
+  RunArtifact,
   Task,
 } from "./domain.js";
 import type { AgentEvent, CreateAgentEvent } from "./events.js";
@@ -98,6 +100,20 @@ export interface RunManifestRepositoryContract {
   list(filter?: PageRequest): Awaitable<Page<RunManifest>>;
 }
 
+export interface RunArtifactRepositoryContract {
+  create(input: CreateRunArtifact, id?: string): Awaitable<RunArtifact>;
+  getForProject(runId: string, projectId: string, artifactId: string): Awaitable<RunArtifact>;
+  listForProject(
+    runId: string,
+    projectId: string,
+    filter?: PageRequest,
+  ): Awaitable<Page<RunArtifact>>;
+  totalBytes(runId: string, projectId: string): Awaitable<number>;
+  listStorageLocators(): Awaitable<string[]>;
+  listExpired(before: string, filter?: PageRequest): Awaitable<Page<RunArtifact>>;
+  delete(id: string): Awaitable<RunArtifact | null>;
+}
+
 export interface AgentEventRepositoryContract {
   append(input: CreateAgentEvent, id?: string): Awaitable<AgentEvent>;
   list(filter: EventFilter): Awaitable<Page<AgentEvent>>;
@@ -136,6 +152,7 @@ export interface RepositorySet {
   tasks: TaskRepositoryContract;
   runs: ExecutionRunRepositoryContract;
   manifests: RunManifestRepositoryContract;
+  artifacts: RunArtifactRepositoryContract;
   events: AgentEventRepositoryContract;
   approvals: ApprovalRepositoryContract;
   evaluations: EvaluationRepositoryContract;
