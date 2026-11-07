@@ -102,7 +102,11 @@ export interface AgentAdapter {
     instruction: string,
     signal: AbortSignal,
   ): Promise<AgentResult>;
-  stream(config: AdapterConfig, signal: AbortSignal): AsyncIterable<NormalizedAgentEvent>;
+  stream(
+    config: AdapterConfig,
+    session: AgentSession,
+    signal: AbortSignal,
+  ): AsyncIterable<NormalizedAgentEvent>;
   cancel(config: AdapterConfig, session: AgentSession): Promise<void>;
   status(config: AdapterConfig, session: AgentSession): Promise<unknown>;
   collectResults(config: AdapterConfig, session: AgentSession): Promise<AgentResult>;
@@ -111,5 +115,13 @@ export interface AgentAdapter {
 
 export interface IsolatedRuntime {
   /** Must create a run-scoped OS sandbox; this is never optional during execution. */
-  assertIsolated(config: AdapterConfig): Promise<{ workspacePath: string; serverUrl: string }>;
+  allocate(config: AdapterConfig, runId: string): Promise<RuntimeAllocation>;
+}
+export interface RuntimeAllocation {
+  workspacePath: string;
+  serverUrl: string;
+  authorizationHeader: string;
+  cancel(): Promise<void>;
+  collectResults(): Promise<AgentResult>;
+  dispose(): Promise<void>;
 }

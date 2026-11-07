@@ -124,12 +124,15 @@ function supported(version: string | null): boolean {
 
 export class OpenCodeAdapter implements AgentAdapter {
   readonly id = "opencode";
-  private client: OpencodeClient | undefined;
-  private workspacePath: string | undefined;
   private sessions = new Map<string, string>();
+  private runtimes = new Map<
+    string,
+    Awaited<ReturnType<NonNullable<IsolatedRuntime>["allocate"]>>
+  >();
+  private clients = new Map<string, OpencodeClient>();
   constructor(
     private readonly runtime: IsolatedRuntime | undefined,
-    private readonly probe: ProcessProbe,
+    private readonly probe: ProcessProbe = systemProcessProbe,
     private readonly makeClient = createOpencodeClient,
   ) {}
   validate(input: unknown): AdapterConfig {
@@ -159,7 +162,10 @@ export class OpenCodeAdapter implements AgentAdapter {
   async health(config: AdapterConfig): Promise<{ healthy: boolean; version?: string }> {
     if (!config.serverUrl) return { healthy: false };
     try {
-      const r = await fetch(new URL("/global/health", config.serverUrl));
+      const server = new URL(config.serverUrl);
+      if (!new Set(["127.0.0.1", "localhost", "[::1]"]).has(server.hostname))
+        return { healthy: false };
+      const r = await fetch(new URL("/global/health", server));
       if (!r.ok) return { healthy: false };
       const body: unknown = await r.json();
       const v =
@@ -174,54 +180,67 @@ export class OpenCodeAdapter implements AgentAdapter {
       return { healthy: false };
     }
   }
-  private async connect(config: AdapterConfig): Promise<OpencodeClient> {
-    const isolated = await this.runtime?.assertIsolated(config);
+  private async connect(config: AdapterConfig, runId: string): Promise<OpencodeClient> {
+    const existing = this.clients.get(runId);
+    if (existing) return existing;
+    const isolated = await this.runtime?.allocate(config, runId);
     if (!isolated)
       throw new Error("OpenCode execution unavailable: no verified isolated runtime configured");
-    const endpoint = new URL(isolated.serverUrl);
-    if (!new Set(["127.0.0.1", "localhost", "[::1]"]).has(endpoint.hostname))
-      throw new Error("Isolated OpenCode server must bind to loopback");
-    if (isolated.workspacePath.toLocaleLowerCase() === config.projectDirectory.toLocaleLowerCase())
-      throw new Error("Isolated workspace cannot be the source repository");
-    this.client = this.makeClient({
-      baseUrl: isolated.serverUrl,
-      directory: isolated.workspacePath,
-    });
-    this.workspacePath = isolated.workspacePath;
-    return this.client;
+    try {
+      const endpoint = new URL(isolated.serverUrl);
+      if (!new Set(["127.0.0.1", "localhost", "[::1]"]).has(endpoint.hostname))
+        throw new Error("Isolated OpenCode server must bind to loopback");
+      if (
+        isolated.workspacePath.toLocaleLowerCase() === config.projectDirectory.toLocaleLowerCase()
+      )
+        throw new Error("Isolated workspace cannot be the source repository");
+      const client = this.makeClient({
+        baseUrl: isolated.serverUrl,
+        directory: isolated.workspacePath,
+        headers: { authorization: isolated.authorizationHeader },
+      });
+      this.runtimes.set(runId, isolated);
+      this.clients.set(runId, client);
+      return client;
+    } catch (error) {
+      await isolated.dispose();
+      throw error;
+    }
   }
   async initializeSession(config: AdapterConfig, runId: string): Promise<AgentSession> {
-    const c = await this.connect(config);
-    const created = await c.session.create({
-      body: { title: `AgentOS run ${runId}` },
-      query: { directory: this.workspacePath! },
-      throwOnError: true,
-    });
-    const id = created.data?.id;
-    if (!id) throw new Error("OpenCode returned no session identifier");
-    this.sessions.set(runId, id);
-    return { id, runId, createdAt: new Date().toISOString() };
+    const c = await this.connect(config, runId);
+    try {
+      const created = await c.session.create({
+        body: { title: `AgentOS run ${runId}` },
+        query: { directory: this.runtimes.get(runId)!.workspacePath },
+        throwOnError: true,
+      });
+      const id = created.data?.id;
+      if (!id) throw new Error("OpenCode returned no session identifier");
+      this.sessions.set(runId, id);
+      return { id, runId, createdAt: new Date().toISOString() };
+    } catch (error) {
+      const runtime = this.runtimes.get(runId);
+      this.runtimes.delete(runId);
+      this.clients.delete(runId);
+      await runtime?.dispose();
+      throw error;
+    }
   }
   async resumeSession(
     config: AdapterConfig,
     sessionId: string,
     runId: string,
   ): Promise<AgentSession> {
-    if (!this.client) await this.connect(config);
-    const existing = await this.client!.session.get({
+    const c = await this.connect(config, runId);
+    const existing = await c.session.get({
       path: { id: sessionId },
-      query: { directory: this.workspacePath! },
+      query: { directory: this.runtimes.get(runId)!.workspacePath },
       throwOnError: true,
     });
     if (!existing.data?.id) throw new Error("OpenCode session was not found");
     this.sessions.set(runId, sessionId);
     return { id: sessionId, runId, createdAt: new Date().toISOString() };
-  }
-  async closeSession(config: AdapterConfig, session: AgentSession): Promise<void> {
-    // OpenCode sessions are durable; DELETE removes their history. Closing an AgentOS handle
-    // must not destroy that history, so only release this adapter's local association.
-    void config;
-    this.sessions.delete(session.runId);
   }
   async execute(
     config: AdapterConfig,
@@ -229,20 +248,25 @@ export class OpenCodeAdapter implements AgentAdapter {
     instruction: string,
     signal: AbortSignal,
   ): Promise<AgentResult> {
-    if (!this.client) await this.connect(config);
-    const c = this.client!;
+    const c = await this.connect(config, session.runId);
     const timeout = AbortSignal.timeout(config.timeoutSeconds * 1000);
     const combined = AbortSignal.any([signal, timeout]);
-    const response = await c.session.prompt({
-      path: { id: session.id },
-      query: { directory: this.workspacePath! },
-      body: {
-        ...(config.model ? { model: config.model } : {}),
-        parts: [{ type: "text", text: instruction }],
-      },
-      throwOnError: true,
-      signal: combined,
-    });
+    let response;
+    try {
+      response = await c.session.prompt({
+        path: { id: session.id },
+        query: { directory: this.runtimes.get(session.runId)!.workspacePath },
+        body: {
+          ...(config.model ? { model: config.model } : {}),
+          parts: [{ type: "text", text: instruction }],
+        },
+        throwOnError: true,
+        signal: combined,
+      });
+    } catch (error) {
+      if (combined.aborted) await this.runtimes.get(session.runId)?.cancel();
+      throw error;
+    }
     const info = response.data?.info as { time?: { completed?: number } } | undefined;
     return {
       status: "succeeded",
@@ -251,9 +275,13 @@ export class OpenCodeAdapter implements AgentAdapter {
       diff: null,
     };
   }
-  async *stream(config: AdapterConfig, signal: AbortSignal): AsyncIterable<NormalizedAgentEvent> {
-    if (!this.client) await this.connect(config);
-    const result = await this.client!.event.subscribe({ signal });
+  async *stream(
+    config: AdapterConfig,
+    session: AgentSession,
+    signal: AbortSignal,
+  ): AsyncIterable<NormalizedAgentEvent> {
+    const c = await this.connect(config, session.runId);
+    const result = await c.event.subscribe({ signal });
     for await (const raw of result.stream) {
       if (signal.aborted) break;
       const normalized = normalizeOpenCodeEvent(raw);
@@ -262,24 +290,36 @@ export class OpenCodeAdapter implements AgentAdapter {
     }
   }
   async cancel(config: AdapterConfig, session: AgentSession): Promise<void> {
-    if (!this.client) await this.connect(config);
-    await this.client!.session.abort({ path: { id: session.id }, throwOnError: true });
+    const c = await this.connect(config, session.runId);
+    await c.session.abort({ path: { id: session.id }, throwOnError: true });
+    await this.runtimes.get(session.runId)?.cancel();
   }
   async status(config: AdapterConfig, session: AgentSession): Promise<unknown> {
-    if (!this.client) await this.connect(config);
-    const result = await this.client!.session.get({
+    const c = await this.connect(config, session.runId);
+    const result = await c.session.get({
       path: { id: session.id },
-      query: { directory: this.workspacePath! },
+      query: { directory: this.runtimes.get(session.runId)!.workspacePath },
       throwOnError: true,
     });
     return result.data;
   }
-  async collectResults(): Promise<AgentResult> {
-    throw new Error("Git results must be collected by the AgentOS workspace manager");
+  async collectResults(_config: AdapterConfig, session: AgentSession): Promise<AgentResult> {
+    const runtime = this.runtimes.get(session.runId);
+    if (!runtime) throw new Error("No isolated runtime is attached to this run");
+    return runtime.collectResults();
+  }
+  async closeSession(_config: AdapterConfig, session: AgentSession): Promise<void> {
+    this.sessions.delete(session.runId);
+    this.clients.delete(session.runId);
+    const runtime = this.runtimes.get(session.runId);
+    this.runtimes.delete(session.runId);
+    await runtime?.dispose();
   }
   async dispose(): Promise<void> {
-    this.client = undefined;
-    this.workspacePath = undefined;
+    const allocated = [...this.runtimes.values()];
+    this.runtimes.clear();
+    this.clients.clear();
+    await Promise.all(allocated.map((runtime) => runtime.dispose()));
     this.sessions.clear();
   }
 }

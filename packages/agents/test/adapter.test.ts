@@ -10,9 +10,18 @@ const config = adapterConfigSchema.parse({
   permissionMode: "supervised",
 });
 const runtime = {
-  assertIsolated: vi.fn(async () => ({
+  allocate: vi.fn(async () => ({
     workspacePath: "C:\\runs\\1",
     serverUrl: "http://127.0.0.1:4096",
+    authorizationHeader: "Basic dGVzdA==",
+    cancel: vi.fn(async () => undefined),
+    collectResults: vi.fn(async () => ({
+      status: "succeeded" as const,
+      summary: null,
+      changedFiles: [],
+      diff: null,
+    })),
+    dispose: vi.fn(async () => undefined),
   })),
 };
 
@@ -132,9 +141,18 @@ describe("OpenCode adapter", () => {
       throw new Error("Mock server did not bind a TCP port");
     const adapter = new OpenCodeAdapter(
       {
-        assertIsolated: async () => ({
+        allocate: async () => ({
           workspacePath: "C:\\runs\\1",
           serverUrl: `http://127.0.0.1:${address.port}`,
+          authorizationHeader: "Basic dGVzdA==",
+          cancel: async () => undefined,
+          collectResults: async () => ({
+            status: "succeeded",
+            summary: null,
+            changedFiles: [],
+            diff: null,
+          }),
+          dispose: async () => undefined,
         }),
       },
       { version: async () => "1.2.0" },
