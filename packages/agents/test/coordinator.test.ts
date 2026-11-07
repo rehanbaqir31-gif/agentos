@@ -291,4 +291,62 @@ describe("durable execution coordinator", () => {
       await rm(f.directory, { recursive: true, force: true });
     }
   });
+
+  it("marks persisted active runs failed after reopening and never replays them", async () => {
+    const f = await fixture();
+    const runId = randomUUID();
+    let reopenedDatabase: Awaited<ReturnType<typeof openDatabase>> | undefined;
+    let firstDatabaseClosed = false;
+    try {
+      let run = await f.repositories.runs.create(
+        {
+          taskId: f.task.id,
+          projectId: f.project.id,
+          agentId: f.agent.id,
+          adapterVersion: "1.2.3",
+          providerId: null,
+          modelId: null,
+          status: "created",
+          manifestId: null,
+          workspaceId: null,
+          startedAt: null,
+          completedAt: null,
+          error: null,
+          usageMetrics: {},
+        },
+        runId,
+      );
+      for (const status of ["validating", "preparing_workspace", "queued", "running"] as const)
+        run = await f.repositories.runs.update(run.id, {
+          status,
+          ...(status === "running" ? { startedAt: at } : {}),
+        });
+      f.database.close();
+      firstDatabaseClosed = true;
+
+      reopenedDatabase = await openDatabase({
+        filename: join(f.directory, "test.sqlite"),
+        now: () => at,
+      });
+      const reopenedRepositories = new Repositories(reopenedDatabase);
+      const coordinator = coordinatorFor(reopenedRepositories, makeAdapter().adapter);
+      const recovered = await coordinator.recoverInterruptedRuns();
+      expect(recovered).toHaveLength(1);
+      expect(recovered[0]).toMatchObject({
+        id: runId,
+        status: "failed",
+        error: expect.stringContaining("automatic replay is disabled"),
+      });
+      const events = await reopenedRepositories.events.list({ runId });
+      expect(events.items.at(-1)).toMatchObject({
+        type: "run.failed",
+        data: { code: "PROCESS_INTERRUPTED" },
+      });
+      expect(await coordinator.recoverInterruptedRuns()).toEqual([]);
+    } finally {
+      if (!firstDatabaseClosed) f.database.close();
+      reopenedDatabase?.close();
+      await rm(f.directory, { recursive: true, force: true });
+    }
+  });
 });

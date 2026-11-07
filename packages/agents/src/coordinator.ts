@@ -43,6 +43,57 @@ export class ExecutionCoordinator {
     private readonly now: () => string = () => new Date().toISOString(),
   ) {}
 
+  /**
+   * Call once during single-worker startup, before accepting new tasks. Active runs are failed
+   * rather than replayed because the adapter prompt may have performed non-idempotent work.
+   */
+  async recoverInterruptedRuns(): Promise<ExecutionRun[]> {
+    const activeStatuses: ExecutionRun["status"][] = [
+      "created",
+      "validating",
+      "preparing_workspace",
+      "queued",
+      "running",
+      "waiting_for_approval",
+    ];
+    const recovered: ExecutionRun[] = [];
+    for (const status of activeStatuses) {
+      const attempted = new Set<string>();
+      while (true) {
+        const page = await this.repositories.runs.list({ status, limit: 200, offset: 0 });
+        const candidates = page.items.filter((candidate) => !attempted.has(candidate.id));
+        if (candidates.length === 0) break;
+        for (const candidate of candidates) {
+          attempted.add(candidate.id);
+          try {
+            const run = await this.repositories.runs.update(candidate.id, {
+              status: "failed",
+              completedAt: candidate.startedAt ? this.now() : null,
+              error: "Execution interrupted by process restart; automatic replay is disabled",
+            });
+            await this.append({
+              runId: run.id,
+              type: "run.failed",
+              occurredAt: this.now(),
+              data: {
+                code: "PROCESS_INTERRUPTED",
+                message: run.error!,
+              },
+            });
+            recovered.push(run);
+          } catch (error) {
+            if (!(error instanceof RepositoryConflictError)) {
+              const current = await this.repositories.runs.getById(candidate.id);
+              if (!isTerminal(current.status)) throw error;
+            }
+            // Another recovery/worker changed this run after our snapshot; keep the winning state.
+          }
+        }
+      }
+    }
+    return recovered;
+  }
+
   async startTask(input: StartTaskInput): Promise<ExecutionOutcome> {
     const task = await this.repositories.tasks.getById(input.taskId);
     const project = await this.repositories.projects.getById(task.projectId);
